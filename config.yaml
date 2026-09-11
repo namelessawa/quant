@@ -91,11 +91,58 @@ factor_registry:
     reject_if_saturated_and_low_novelty: true
 
   # Research correlation gate. Official BRAIN SELF_CORRELATION verdicts are
-  # always stored as delivered; this only controls the local 0.70 cutoff.
+  # always stored as delivered; the local research cutoff is deliberately
+  # stricter than the official 0.70 so submission-time corr fails are rare.
+  # threshold (legacy alias) is accepted and seeds both cutoffs; the explicit
+  # values below win when present.
   correlation:
     enabled: true
-    threshold: 0.70
+    threshold: 0.70             # legacy alias / official compatibility
+    official_threshold: 0.70    # BRAIN submission hard limit
+    research_threshold: 0.65    # local gate: >= this blocks further work
+    warning_threshold: 0.55     # banded "close" warning below the cutoff
+    margin_warning: 0.05        # within 0.05 of the limit => very close
+    allow_submit_without_corr: false  # PENDING/unknown corr is NOT a pass
     use_absolute_value: true    # -0.9 is as redundant as +0.9
+
+  # Deterministic two-layer similarity engine (field layer + structure layer).
+  # Weights inside each subgroup are normalized at use time; raw negatives are
+  # clamped first. The section is intentionally flat.
+  similarity:
+    field_exact_weight: 0.6      # same concrete field (close == close)
+    field_family_weight: 0.4     # same family (close ~ vwap)
+    operator_set_weight: 0.20
+    operator_multiset_weight: 0.15
+    root_weight: 0.15
+    depth_weight: 0.10
+    path_weight: 0.40            # root->leaf operator paths
+    overall_structure_weight: 0.50
+    overall_field_weight: 0.30
+    overall_window_weight: 0.20
+
+  # Alpha-memory knobs: saturation penalties, underexplored-space thresholds,
+  # overfit/one-sided heuristics and high-quality-redundant criteria.
+  memory:
+    family_saturation_scale: 10
+    combination_saturation_scale: 10
+    saturated_family_min_trials: 20
+    saturated_family_max_submit_rate: 0.10
+    underexplored_family_max_trials: 5
+    overused_structure_min_trials: 5
+    saturated_combo_min_trials: 10
+    saturated_combo_max_submit_rate: 0.10
+    underexplored_combo_max_trials: 3
+    high_corr_average: 0.70
+    high_quality_min_sharpe: 1.5
+    high_quality_min_fitness: 1.5
+    one_sided_book_ratio: 0.80
+    overfit_test_retention: 0.50
+    overfit_min_train_sharpe: 1.5
+    same_signal_novelty_factor: 0.35
+    neighbor_pool_limit: 500
+    cluster_saturated_min_size: 3
+    cluster_saturated_avg_corr: 0.70
+    underexplored_dataset_max_trials: 3
 
   # Novelty component weights (rescaled to sum to 1).
   novelty:

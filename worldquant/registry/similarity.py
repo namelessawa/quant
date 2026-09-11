@@ -5,12 +5,27 @@ horizon while 20 vs 120 is not. Two calibrated views are provided:
 
 * horizon buckets (1-5 / 6-20 / 21-60 / 61-120 / 121-252 / 252+), and
 * a continuous ``abs(log(w1/w2))`` distance.
+
+Two layers deliberately lost by a plain Jaccard are recovered here:
+
+* **Field families** — ``close`` and ``vwap`` share zero characters in an
+  exact-name set, but both are ``PRICE`` fields, so
+  ``rank(ts_delta(close,10))`` stays similar to
+  ``rank(ts_delta(vwap,10))``.
+* **Operator paths** — an operator *set* cannot tell
+  ``rank(ts_mean(ts_delta(x,5),20))`` from
+  ``ts_mean(rank(ts_delta(x,5)),20)``; root-to-leaf operator chains can.
+
+All weights come from :class:`~worldquant.registry.config.SimilarityConfig`.
 """
 
 from __future__ import annotations
 
 import math
+from collections import Counter
 from typing import Iterable, Sequence
+
+from .config import SimilarityConfig
 
 #: Configurable horizon bucket edges (inclusive upper bounds).
 HORIZON_BUCKETS: tuple[int, ...] = (5, 20, 60, 120, 252)
@@ -38,6 +53,19 @@ def jaccard(left: Iterable, right: Iterable) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def multiset_jaccard(left: Counter | dict, right: Counter | dict) -> float:
+    """Jaccard over multiplicities: min-count intersection / max-count union."""
+    a = Counter(dict(left))
+    b = Counter(dict(right))
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    intersection = sum((a & b).values())
+    union = sum((a | b).values())
+    return intersection / union if union else 0.0
 
 
 def window_set_similarity(windows_a: Sequence[int], windows_b: Sequence[int]) -> float:
@@ -76,6 +104,38 @@ def depth_similarity(depth_a: int, depth_b: int) -> float:
     return 1.0 - abs(depth_a - depth_b) / max(depth_a, depth_b, 1)
 
 
+def field_similarity(
+    fields_a: Iterable[str],
+    fields_b: Iterable[str],
+    families_a: Iterable[str] | None = None,
+    families_b: Iterable[str] | None = None,
+    config: SimilarityConfig | None = None,
+) -> float:
+    """Two-layer field similarity.
+
+    ``exact`` compares concrete field names; ``family`` compares the
+    field-family *multiset* (so close/open/vwap all collapse into PRICE).
+    """
+    cfg = config or SimilarityConfig()
+    weights = cfg.normalized()
+    exact_sim = jaccard(fields_a, fields_b)
+    if families_a is not None and families_b is not None:
+        family_sim = multiset_jaccard(Counter(families_a), Counter(families_b))
+        we, wf = weights["field_exact"], weights["field_family"]
+        total = we + wf
+        if total <= 0:
+            return exact_sim
+        return (we * exact_sim + wf * family_sim) / total
+    return exact_sim
+
+
+def _weighted(parts: list[tuple[float, float]]) -> float:
+    total = sum(weight for _, weight in parts)
+    if total <= 0:
+        return 0.0
+    return sum(value * weight for value, weight in parts) / total
+
+
 def structure_feature_similarity(
     operators_a: set[str],
     operators_b: set[str],
@@ -83,12 +143,32 @@ def structure_feature_similarity(
     root_b: str,
     depth_a: int,
     depth_b: int,
+    *,
+    multiset_a: Counter | dict | None = None,
+    multiset_b: Counter | dict | None = None,
+    paths_a: Sequence[str] | None = None,
+    paths_b: Sequence[str] | None = None,
+    config: SimilarityConfig | None = None,
 ) -> float:
-    """Feature-level structure similarity when structure hashes differ."""
-    operator_sim = jaccard(operators_a, operators_b)
-    root_sim = 1.0 if root_a and root_a == root_b else 0.0
-    depth_sim = depth_similarity(depth_a, depth_b)
-    return 0.6 * operator_sim + 0.25 * root_sim + 0.15 * depth_sim
+    """Feature-level structure similarity when structure hashes differ.
+
+    Operator *set* Jaccard is deliberately just one term: multiset counts
+    repeated transforms and root-to-leaf paths preserve AST nesting order.
+    """
+    cfg = config or SimilarityConfig()
+    w = cfg.normalized()
+    parts: list[tuple[float, float]] = [
+        (jaccard(operators_a, operators_b), w["operator_set"]),
+        (1.0 if root_a and root_a == root_b else 0.0, w["root"]),
+        (depth_similarity(depth_a, depth_b), w["depth"]),
+    ]
+    if multiset_a is not None and multiset_b is not None:
+        parts.append(
+            (multiset_jaccard(multiset_a, multiset_b), w["operator_multiset"])
+        )
+    if paths_a is not None and paths_b is not None:
+        parts.append((jaccard(paths_a, paths_b), w["path"]))
+    return _weighted(parts)
 
 
 def overall_similarity(
@@ -104,14 +184,33 @@ def overall_similarity(
     fields_b: set[str],
     windows_a: Sequence[int],
     windows_b: Sequence[int],
+    families_a: Iterable[str] | None = None,
+    families_b: Iterable[str] | None = None,
+    multiset_a: Counter | dict | None = None,
+    multiset_b: Counter | dict | None = None,
+    paths_a: Sequence[str] | None = None,
+    paths_b: Sequence[str] | None = None,
+    config: SimilarityConfig | None = None,
 ) -> float:
     """The 0..1 score used by ``find_similar`` / structure duplicate level."""
+    cfg = config or SimilarityConfig()
+    weights = cfg.normalized()
     if structure_equal:
         structure_sim = 1.0
     else:
         structure_sim = structure_feature_similarity(
-            operators_a, operators_b, root_a, root_b, depth_a, depth_b
+            operators_a, operators_b, root_a, root_b, depth_a, depth_b,
+            multiset_a=multiset_a, multiset_b=multiset_b,
+            paths_a=paths_a, paths_b=paths_b, config=cfg,
         )
-    field_sim = jaccard(fields_a, fields_b)
+    field_sim = field_similarity(
+        fields_a, fields_b, families_a, families_b, config=cfg
+    )
     window_sim = window_set_similarity(list(windows_a), list(windows_b))
-    return 0.5 * structure_sim + 0.3 * field_sim + 0.2 * window_sim
+    return _weighted(
+        [
+            (structure_sim, weights["overall_structure"]),
+            (field_sim, weights["overall_field"]),
+            (window_sim, weights["overall_window"]),
+        ]
+    )

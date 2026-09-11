@@ -308,10 +308,56 @@ class TestScoring:
 # Correlation gate
 # --------------------------------------------------------------------------- #
 class TestCorrelationGate:
-    def test_vacuous_pass_with_no_records(self):
+    def test_no_records_is_unknown_not_a_vacuous_pass(self):
         decision = CorrelationGate().evaluate(1, [])
-        assert decision.passed is True
+        # v2 contract: no evidence is UNKNOWN, never a pass; submission is
+        # blocked by default (allow_submit_without_corr=False).
+        assert decision.passed is False
+        assert decision.status.value == "UNKNOWN"
+        assert decision.band.value == "UNKNOWN"
         assert decision.evaluated == 0
+        assert decision.submission_allowed is False
+        assert decision.corr_margin is None
+
+    def test_unknown_can_be_overridden_only_via_config(self):
+        gate = CorrelationGate(CorrelationConfig(allow_submit_without_corr=True))
+        decision = gate.evaluate(1, [])
+        assert decision.status.value == "UNKNOWN"
+        assert decision.passed is False  # still not a pass...
+        assert decision.submission_allowed is True  # ...but manual override allowed
+
+    def test_pending_records_are_unknown(self):
+        decision = CorrelationGate().evaluate(
+            1,
+            [
+                {"correlation": None, "status": "PENDING", "other_brain_alpha_id": "x"},
+                {"correlation": 0.9, "status": "IN_PROGRESS", "other_brain_alpha_id": "y"},
+            ],
+        )
+        assert decision.status.value == "UNKNOWN"
+        assert decision.passed is False
+        assert decision.evaluated == 0
+
+    def test_completed_low_corr_is_a_real_pass(self):
+        decision = CorrelationGate().evaluate(
+            1, [{"correlation": 0.31, "status": "COMPLETED", "other_brain_alpha_id": "a2"}]
+        )
+        assert decision.status.value == "PASS"
+        assert decision.passed is True
+        assert decision.band.value == "DIVERSE"
+        assert decision.submission_allowed is True
+        assert decision.corr_margin == pytest.approx(0.65 - 0.31)
+
+    def test_warning_band_and_very_close_margin(self):
+        warning = CorrelationGate().evaluate(
+            1, [{"correlation": 0.60, "other_brain_alpha_id": "a"}]
+        )
+        assert warning.passed is True
+        assert warning.band.value == "WARNING"
+        close = CorrelationGate().evaluate(
+            1, [{"correlation": 0.63, "other_brain_alpha_id": "a"}]
+        )
+        assert close.very_close_to_limit is True
 
     def test_positive_over_threshold_fails(self):
         decision = CorrelationGate().evaluate(

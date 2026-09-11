@@ -25,6 +25,7 @@ Three fingerprints are produced, matching the project brief::
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Union
 
@@ -508,17 +509,122 @@ def root_operator(node: Node) -> str:
 def operator_set(node: Node) -> set[str]:
     names: set[str] = set()
     for part in walk(node):
-        if isinstance(part, CallNode):
-            names.add(part.name)
-        elif isinstance(part, KeywordNode):
-            names.add(part.name)
-        elif isinstance(part, BinOpNode):
-            names.add(_BINOP_NAMES.get(part.op, part.op))
-        elif isinstance(part, UnaryOpNode):
-            names.add("negative" if part.op == "-" else f"unary_{part.op}")
-        elif isinstance(part, TernaryNode):
-            names.add("ternary")
+        label = _operator_label(part)
+        if label:
+            names.add(label)
     return names
+
+
+def _operator_label(node: Node) -> str | None:
+    """Stable operator name for any operator-ish AST node (None for leaves)."""
+    if isinstance(node, (CallNode, KeywordNode)):
+        return node.name
+    if isinstance(node, BinOpNode):
+        return _BINOP_NAMES.get(node.op, node.op)
+    if isinstance(node, UnaryOpNode):
+        return "negative" if node.op == "-" else f"unary_{node.op}"
+    if isinstance(node, TernaryNode):
+        return "ternary"
+    return None
+
+
+def operator_multiset(node: Node) -> Counter:
+    """Operator occurrences with multiplicity (unlike the set view).
+
+    ``rank(x) + rank(x)`` counts ``rank`` twice — order is still ignored here, but
+    repeated transformations are visible, which the plain set hides.
+    """
+    counts: Counter = Counter()
+    for part in walk(node):
+        label = _operator_label(part)
+        if label:
+            counts[label] += 1
+    return counts
+
+
+def operator_paths(node: Node) -> list[str]:
+    """Root-to-leaf operator chains, e.g. ``rank>ts_mean>ts_delta``.
+
+    One path is produced for every value-carrying leaf. Two expressions with
+    the same operator *set* but different nesting (``rank(ts_mean(...))`` vs
+    ``ts_mean(rank(...))``) therefore never share the same path set.
+    """
+    paths: set[str] = set()
+
+    def _descend(current: Node, chain: list[str]) -> None:
+        label = _operator_label(current)
+        here = chain + [label] if label else chain
+        if isinstance(current, (NumberNode, StringNode)):
+            return
+        if isinstance(current, VarNode):
+            lowered = current.name.lower()
+            if (
+                lowered not in LANGUAGE_CONSTANTS
+                and lowered not in GROUP_LABELS
+            ):
+                paths.add(">".join(here))
+            return
+        children: list[Node] = []
+        if isinstance(current, (CallNode, KeywordNode)):
+            children.extend(current.args)
+            if isinstance(current, CallNode):
+                children.extend(value for _, value in current.kwargs)
+        elif isinstance(current, BinOpNode):
+            children.extend([current.left, current.right])
+        elif isinstance(current, UnaryOpNode):
+            children.append(current.operand)
+        elif isinstance(current, TernaryNode):
+            children.extend([current.condition, current.when_true, current.when_false])
+        elif isinstance(current, AssignNode):
+            children.append(current.value)
+        for child in children:
+            _descend(child, here)
+
+    _descend(node, [])
+    return sorted(paths)
+
+
+#: Nodes whose *immediate* sub-expressions are worth remembering as legs:
+#: arithmetic blends and the grouping/regime wrappers.
+SUBTREE_BINOPS = frozenset({"+", "-", "*", "/"})
+SUBTREE_CALLS = frozenset(
+    {"trade_when", "group_neutralize", "group_rank", "group_zscore"}
+)
+
+
+def _subtree_legs(name: str, node: Node) -> list[Node]:
+    """Ordered value-carrying legs of a blend/group node.
+
+    ``+ - * /`` have two legs; ``trade_when``'s alpha is the middle argument
+    (the trigger is a regime, not a factor leg); group wrappers transform one
+    value expression (the trailing group/sector label is not a leg).
+    """
+    if isinstance(node, BinOpNode):
+        return [node.left, node.right]
+    if not isinstance(node, CallNode):
+        return []
+    lowered = name.lower()
+    if lowered == "trade_when":
+        return [node.args[1]] if len(node.args) > 1 else []
+    return [node.args[0]] if node.args else []
+
+
+def major_subtrees(node: Node) -> list[tuple[str, Node]]:
+    """``(operator_label, subtree_node)`` pairs for every blend/group node.
+
+    Captures nested legs too: on ``rank(ts_delta(close,10)) +
+    rank(ts_zscore(volume,20))`` it returns the outer ``add`` plus each group
+    wrapper, so the registry can remember that a PRICE_REVERSAL leg and a
+    LIQUIDITY leg were individually combined.
+    """
+    found: list[tuple[str, Node]] = []
+    for part in walk(node):
+        if isinstance(part, BinOpNode) and part.op in SUBTREE_BINOPS:
+            found.append((_BINOP_NAMES[part.op], part))
+        elif isinstance(part, CallNode) and part.name.lower() in SUBTREE_CALLS:
+            found.append((part.name.lower(), part))
+    return found
+
 
 
 # --------------------------------------------------------------------------- #
@@ -673,6 +779,12 @@ class ExpressionFeatures:
     family_template: str = ""
     structure: str = ""
     assigned_locals: list[str] = field(default_factory=list)
+    #: Root-to-leaf operator chains across every statement.
+    operator_paths: list[str] = field(default_factory=list)
+    #: Operator name -> occurrence count across every statement.
+    operator_multiset: dict[str, int] = field(default_factory=dict)
+    #: Major blend/group sub-expressions with their own fingerprints.
+    subtrees: list[dict[str, Any]] = field(default_factory=list)
 
     def to_feature_json(self) -> dict[str, Any]:
         return {
@@ -686,6 +798,9 @@ class ExpressionFeatures:
             "unknown_tokens": self.unknown_tokens,
             "parsed": self.parsed,
             "assigned_locals": self.assigned_locals,
+            "operator_paths": self.operator_paths,
+            "operator_multiset": self.operator_multiset,
+            "subtrees": self.subtrees,
         }
 
 
@@ -726,6 +841,8 @@ def analyze_expression(
     program_fields: list[str] = []
     program_windows: set[int] = set()
     seen_fields: set[str] = set()
+    program_paths: set[str] = set()
+    program_multiset: Counter = Counter()
     for statement in statements:
         program_operators.update(operator_set(statement))
         for field_name in extract_fields(statement, assigned=assigned):
@@ -733,10 +850,14 @@ def analyze_expression(
                 seen_fields.add(field_name.lower())
                 program_fields.append(field_name)
         program_windows.update(extract_windows(statement))
+        program_paths.update(operator_paths(statement))
+        program_multiset.update(operator_multiset(statement))
 
     operators = sorted(program_operators)
     fields = program_fields
     windows = sorted(program_windows)
+
+    subtrees = _subtree_fingerprints(statements, assigned, ctx)
 
     return ExpressionFeatures(
         fields=fields,
@@ -754,4 +875,55 @@ def analyze_expression(
         family_template=render_statements(statements, "family", ctx),
         structure=render_statements(statements, "structure", ctx),
         assigned_locals=sorted(assigned),
+        operator_paths=sorted(program_paths),
+        operator_multiset=dict(program_multiset),
+        subtrees=subtrees,
     )
+
+
+def _subtree_fingerprints(
+    statements: list[Node],
+    assigned: set[str],
+    ctx: "RenderContext",
+) -> list[dict[str, Any]]:
+    """Render every leg of every major blend/group subtree.
+
+    One entry per distinct (operator label, structure) pair, so a repeated
+    ``a+a+a`` blend is recorded once. Each entry carries an ordered ``legs``
+    list; the store hashes every leg independently. ``-`` / ``/`` legs stay
+    ordered, commutative normalization happens at the store/combination layer.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for statement in statements:
+        scan_root = statement.value if isinstance(statement, AssignNode) else statement
+        for label, node in major_subtrees(scan_root):
+            structure = node.render("structure", ctx)
+            key = (label, structure)
+            if key in seen:
+                continue
+            seen.add(key)
+            legs: list[dict[str, Any]] = []
+            for index, leg in enumerate(_subtree_legs(label, node)):
+                leg_fields = extract_fields(leg, assigned=assigned)
+                legs.append(
+                    {
+                        "index": index,
+                        "fields": leg_fields,
+                        "depth": tree_depth(leg),
+                        "template": leg.render("template", ctx),
+                        "field_template": leg.render("field", ctx),
+                        "family_template": leg.render("family", ctx),
+                        "structure": leg.render("structure", ctx),
+                    }
+                )
+            if not legs:
+                continue
+            out.append(
+                {
+                    "node": label,
+                    "depth": tree_depth(node),
+                    "legs": legs,
+                }
+            )
+    return out

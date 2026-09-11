@@ -51,6 +51,34 @@ class CorrelationCluster:
     representative_id: int
     size: int
     submitted_count: int
+    #: Enrichment (populated by :func:`get_clusters`).
+    family_distribution: dict[str, int] | None = None
+    field_distribution: dict[str, int] | None = None
+    template_distribution: dict[str, int] | None = None
+    best_sharpe: float | None = None
+    best_fitness: float | None = None
+    avg_corr: float | None = None
+    max_corr: float | None = None
+    saturated: bool = False
+    theme: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cluster_id": self.cluster_id,
+            "representative_id": self.representative_id,
+            "factor_ids": self.factor_ids,
+            "size": self.size,
+            "submitted_count": self.submitted_count,
+            "family_distribution": self.family_distribution,
+            "field_distribution": self.field_distribution,
+            "template_distribution": self.template_distribution,
+            "best_sharpe": self.best_sharpe,
+            "best_fitness": self.best_fitness,
+            "avg_corr": self.avg_corr,
+            "max_corr": self.max_corr,
+            "saturated": self.saturated,
+            "theme": self.theme,
+        }
 
 
 def _edges(registry: FactorRegistry, threshold: float) -> list[tuple[int, int, float]]:
@@ -120,6 +148,9 @@ def get_clusters(
         uf.add(int(row["id"]))
 
     edges = _edges(registry, float(cutoff))
+    edge_lookup = {
+        (min(a, b), max(a, b)): weight for a, b, weight in edges
+    }
     for a, b, _ in edges:
         uf.add(a)
         uf.add(b)
@@ -171,6 +202,7 @@ def get_clusters(
         )
 
     clusters: list[CorrelationCluster] = []
+    memory = registry.config.memory
     for members in groups.values():
         if len(members) < min_size:
             continue
@@ -182,6 +214,42 @@ def get_clusters(
             if (row := factors.get(fid)) is not None
             and row["status"] == FactorStatus.SUBMITTED
         )
+
+        member_metrics = [
+            metrics[fid] for fid in ordered if fid in metrics
+        ]
+        sharpes = [
+            float(row["sharpe"]) for row in member_metrics
+            if row["sharpe"] is not None
+        ]
+        fitnesses = [
+            float(row["fitness"]) for row in member_metrics
+            if row["fitness"] is not None
+        ]
+        best_sharpe = max(sharpes) if sharpes else None
+        best_fitness = max(fitnesses) if fitnesses else None
+
+        internal_weights = [
+            weight
+            for i, a in enumerate(ordered)
+            for b in ordered[i + 1:]
+            if (weight := edge_lookup.get((a, b))) is not None
+        ]
+        avg_corr = (
+            sum(internal_weights) / len(internal_weights)
+            if internal_weights else None
+        )
+        max_corr = max(internal_weights) if internal_weights else None
+
+        family_dist, field_dist, template_dist, theme = _distributions(
+            registry, ordered
+        )
+        saturated = (
+            len(ordered) >= memory.cluster_saturated_min_size
+            and avg_corr is not None
+            and avg_corr >= memory.cluster_saturated_avg_corr
+        )
+
         clusters.append(
             CorrelationCluster(
                 cluster_id=representative,
@@ -189,10 +257,63 @@ def get_clusters(
                 representative_id=representative,
                 size=len(ordered),
                 submitted_count=submitted_count,
+                family_distribution=family_dist,
+                field_distribution=field_dist,
+                template_distribution=template_dist,
+                best_sharpe=best_sharpe,
+                best_fitness=best_fitness,
+                avg_corr=avg_corr,
+                max_corr=max_corr,
+                saturated=saturated,
+                theme=theme,
             )
         )
     clusters.sort(key=lambda cluster: cluster.size, reverse=True)
     return clusters
+
+
+def _distributions(
+    registry: FactorRegistry, member_ids: list[int]
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], str | None]:
+    """Family / concrete-field / template histograms + dominant theme."""
+    import json
+    from collections import Counter
+
+    if not member_ids:
+        return {}, {}, {}, None
+    placeholders = ",".join("?" for _ in member_ids)
+    rows = registry._query(
+        f"""
+        SELECT f.family_template, f.theme, ff.fields_json, ff.factor_family
+        FROM factors f LEFT JOIN factor_features ff ON ff.factor_id = f.id
+        WHERE f.id IN ({placeholders})
+        """,
+        tuple(member_ids),
+    )
+    family_counter: Counter = Counter()
+    field_counter: Counter = Counter()
+    template_counter: Counter = Counter()
+    theme_counter: Counter = Counter()
+    for row in rows:
+        if row["factor_family"]:
+            family_counter[str(row["factor_family"])] += 1
+        if row["family_template"]:
+            template_counter[str(row["family_template"])] += 1
+        if row["theme"]:
+            theme_counter[str(row["theme"])] += 1
+        try:
+            fields = json.loads(row["fields_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            fields = []
+        for name in fields:
+            field_counter[str(name)] += 1
+    theme = theme_counter.most_common(1)[0][0] if theme_counter else None
+    return (
+        dict(family_counter.most_common(10)),
+        dict(field_counter.most_common(15)),
+        dict(template_counter.most_common(10)),
+        theme,
+    )
 
 
 def get_cluster_representatives(
@@ -219,6 +340,15 @@ def get_cluster_representatives(
                 "turnover": metrics.get("turnover"),
                 "drawdown": metrics.get("drawdown"),
                 "members": cluster.factor_ids,
+                "family_distribution": cluster.family_distribution,
+                "field_distribution": cluster.field_distribution,
+                "template_distribution": cluster.template_distribution,
+                "best_sharpe": cluster.best_sharpe,
+                "best_fitness": cluster.best_fitness,
+                "avg_corr": cluster.avg_corr,
+                "max_corr": cluster.max_corr,
+                "saturated": cluster.saturated,
+                "theme": cluster.theme,
             }
         )
     return representatives

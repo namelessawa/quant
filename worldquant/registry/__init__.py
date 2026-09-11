@@ -39,25 +39,37 @@ from .combinations import Combination, extract_combinations
 from .config import (
     ClusteringConfig,
     CorrelationConfig,
+    MemoryConfig,
     NoveltyWeights,
     PreSimulationConfig,
     RegistryConfig,
     ScoringConfig,
+    SimilarityConfig,
     build_registry_config,
 )
 from .context import build_generation_context
-from .correlation import CorrelationDecision, CorrelationGate
+from .correlation import (
+    CorrelationBand,
+    CorrelationDecision,
+    CorrelationGate,
+    CorrelationStatus,
+)
 from .expr_parser import (
     ExpressionFeatures,
     ParseError,
     analyze_expression,
     parse_expression_ast,
 )
+from .failures import (
+    FAILURE_LABELS,
+    classify_failure,
+)
 from .families import FieldFamilyResolver, classify_factor_family
 from .gates import (
     ACTION_REJECT_EXACT,
     ACTION_SIMULATE,
     ACTION_SKIP_LOW_NOVELTY,
+    ACTION_SKIP_SIGNAL_DUPLICATE,
     DuplicateCheckResult,
     NoveltyResult,
     PreSimulationGateResult,
@@ -66,6 +78,7 @@ from .gates import (
     pre_simulation_gate,
 )
 from .importer import import_submitted_factors, migrate_existing_results
+from .migrations import SCHEMA_VERSION
 from .scoring import quality_score, research_priority
 from .store import (
     CORR_TYPE_PRODUCTION,
@@ -76,6 +89,7 @@ from .store import (
     RegisteredCandidate,
     SimilarFactor,
 )
+from .themes import classify_theme
 
 __all__ = [
     # store / lifecycle
@@ -90,10 +104,13 @@ __all__ = [
     "RegistryConfig",
     "PreSimulationConfig",
     "CorrelationConfig",
+    "SimilarityConfig",
+    "MemoryConfig",
     "NoveltyWeights",
     "ClusteringConfig",
     "ScoringConfig",
     "build_registry_config",
+    "SCHEMA_VERSION",
     # parser / families / combinations
     "ExpressionFeatures",
     "ParseError",
@@ -113,11 +130,18 @@ __all__ = [
     "ACTION_SIMULATE",
     "ACTION_REJECT_EXACT",
     "ACTION_SKIP_LOW_NOVELTY",
+    "ACTION_SKIP_SIGNAL_DUPLICATE",
     # correlation / scoring
     "CorrelationGate",
     "CorrelationDecision",
+    "CorrelationStatus",
+    "CorrelationBand",
     "quality_score",
     "research_priority",
+    # taxonomy
+    "classify_theme",
+    "classify_failure",
+    "FAILURE_LABELS",
     # clusters / context
     "CorrelationCluster",
     "get_clusters",

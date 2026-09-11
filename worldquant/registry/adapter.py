@@ -25,6 +25,7 @@ from ..logging_utils import get_logger
 from .gates import (
     ACTION_REJECT_EXACT,
     ACTION_SKIP_LOW_NOVELTY,
+    ACTION_SKIP_SIGNAL_DUPLICATE,
     PreSimulationGateResult,
     pre_simulation_gate,
 )
@@ -79,23 +80,47 @@ def gate_candidate(
     registry: FactorRegistry,
     expression: str,
     settings: dict[str, Any],
+    *,
+    source: str | None = None,
+    force: bool = False,
+    ablation_group_id: str | None = None,
+    changed_parameters: dict[str, Any] | None = None,
+    parent_experiment_id: int | None = None,
 ) -> tuple[int | None, PreSimulationGateResult | None]:
     """Register a candidate and run the pre-simulation gate.
 
     Returns ``(factor_id, decision)``. A rejected/skipped candidate has its
     lifecycle status recorded already (``DUPLICATE`` — the exact row for an
-    exact match, or a novelty-saturated skip tagged in the reason). Returns
-    ``(None, None)`` when bookkeeping itself fails, in which case the caller
-    should not block the simulation.
+    exact match, or a novelty/signal-saturation skip tagged in the reason).
+    Returns ``(None, None)`` when bookkeeping itself fails, in which case the
+    caller should not block the simulation.
+
+    Pass ``source='ablation'`` (or ``ablation_group_id``) for deliberate
+    parameter sweeps: same-signal skips are then suppressed by design.
     """
     try:
-        candidate = registry.register_candidate(expression, settings)
+        candidate = registry.register_candidate(
+            expression,
+            settings,
+            source=source or "generator",
+            ablation_group_id=ablation_group_id,
+            changed_parameters=changed_parameters,
+            parent_experiment_id=parent_experiment_id,
+        )
         factor_id = candidate.factor_id
-        decision = pre_simulation_gate(registry, expression, settings)
+        decision = pre_simulation_gate(
+            registry, expression, settings, source=source, force=force
+        )
         if not decision.passed:
             if decision.action == ACTION_REJECT_EXACT:
                 registry.mark_duplicate(
                     factor_id, f"exact duplicate: {decision.reason}"
+                )
+            elif decision.action == ACTION_SKIP_SIGNAL_DUPLICATE:
+                # Same canonical expression already explored with different
+                # settings; the message steers toward new data/legs, not sweeps.
+                registry.mark_duplicate(
+                    factor_id, f"same signal skip: {decision.reason}"
                 )
             elif decision.action == ACTION_SKIP_LOW_NOVELTY:
                 # No dedicated status for this; record it as a pre-simulation

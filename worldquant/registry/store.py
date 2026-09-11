@@ -23,16 +23,34 @@ from typing import Any, Iterable, Sequence
 
 from ..api import normalize_settings
 from ..exceptions import StorageError
-from ..hashing import _HASH_SEPARATOR, dedup_key, normalize_expression
+from ..hashing import (
+    _HASH_SEPARATOR,
+    dedup_key,
+    expression_hash,
+    normalize_expression,
+)
 from ..logging_utils import get_logger
 from ..storage import utcnow_iso
 from .combinations import Combination, extract_combinations
 from .config import RegistryConfig
-from .correlation import CorrelationDecision, CorrelationGate
+from .correlation import (
+    CorrelationBand,
+    CorrelationDecision,
+    CorrelationGate,
+    CorrelationStatus,
+)
 from .expr_parser import analyze_expression, parse_expression_ast
+from .failures import (
+    DUPLICATE as _FAILURE_DUPLICATE,
+    SELF_CORRELATION as _FAILURE_SELF_CORRELATION,
+    SIMULATION_ERROR as _FAILURE_SIM_ERROR,
+    classify_failure,
+)
 from .families import FieldFamilyResolver, classify_factor_family
+from .migrations import SCHEMA_VERSION, ensure_migrated
 from .scoring import quality_score
 from .similarity import jaccard, overall_similarity, window_set_similarity
+from .themes import classify_theme
 
 # --------------------------------------------------------------------------- #
 # Lifecycle
@@ -100,7 +118,23 @@ CREATE TABLE IF NOT EXISTS factors (
     parent_factor_id     INTEGER,
     rejection_reason     TEXT,
     quality_score        REAL,
-    novelty_score        REAL
+    novelty_score        REAL,
+    -- v2 identity layer -----------------------------------------------------
+    signal_hash          TEXT,
+    experiment_hash      TEXT,
+    family_template_hash TEXT,
+    ablation_group_id    TEXT,
+    changed_parameters_json TEXT,
+    parent_experiment_id INTEGER,
+    high_quality_redundant INTEGER NOT NULL DEFAULT 0,
+    failure_category     TEXT,
+    corr_status          TEXT,
+    corr_band            TEXT,
+    corr_margin          REAL,
+    nearest_cluster_id   INTEGER,
+    theme                TEXT,
+    branch               TEXT,
+    subtheme             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS factor_metrics (
@@ -153,7 +187,10 @@ CREATE TABLE IF NOT EXISTS factor_features (
     field_family         TEXT,
     assigned_locals_json TEXT,
     combination_keys_json TEXT,
-    feature_json         TEXT
+    feature_json         TEXT,
+    operator_paths_json  TEXT,
+    operator_multiset_json TEXT,
+    field_families_json  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS factor_combinations (
@@ -174,7 +211,30 @@ CREATE TABLE IF NOT EXISTS factor_combinations (
     abs_corr_sum           REAL,
     abs_corr_n             INTEGER NOT NULL DEFAULT 0,
     best_factor_id         INTEGER,
-    updated_at             TEXT NOT NULL
+    updated_at             TEXT NOT NULL,
+    left_template_hash     TEXT,
+    right_template_hash    TEXT,
+    left_structure_hash    TEXT,
+    right_structure_hash   TEXT,
+    structure_hash         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS factor_subtrees (
+    factor_id           INTEGER NOT NULL REFERENCES factors(id) ON DELETE CASCADE,
+    subtree_index       INTEGER NOT NULL,
+    node_label          TEXT NOT NULL,
+    leg_index           INTEGER NOT NULL,
+    leg_family          TEXT,
+    leg_template_hash   TEXT,
+    leg_structure_hash  TEXT,
+    leg_template        TEXT,
+    leg_structure       TEXT,
+    PRIMARY KEY (factor_id, subtree_index, leg_index)
+);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_factors_template    ON factors(template_hash);
@@ -185,6 +245,11 @@ CREATE INDEX IF NOT EXISTS idx_features_family     ON factor_features(factor_fam
 CREATE INDEX IF NOT EXISTS idx_corr_factor         ON factor_correlations(factor_id);
 CREATE INDEX IF NOT EXISTS idx_corr_other          ON factor_correlations(other_factor_id);
 CREATE INDEX IF NOT EXISTS idx_corr_brain_other    ON factor_correlations(other_brain_alpha_id);
+-- v2-added indexes (signal/experiment/family-template hashes, failure/corr/
+-- theme columns, factor_subtrees) live in migrations._EXTRA_DDL so they are
+-- created only AFTER the additive ALTER TABLE on pre-v2 databases.
+-- user_version for a brand-new database is set to SCHEMA_VERSION in __init__
+-- (after detecting the table was absent), so a pre-v2 file is not masked.
 """
 
 
@@ -254,7 +319,31 @@ class FactorRegistry:
             try:
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA foreign_keys=ON")
+                pre_existing = bool(
+                    self._conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='factors'"
+                    ).fetchone()
+                )
                 self._conn.executescript(_SCHEMA)
+                if not pre_existing:
+                    # Brand-new database: _SCHEMA already creates the full v2
+                    # shape, so stamp it directly and skip backup/migration.
+                    self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self._conn.commit()
+                upgraded = ensure_migrated(self._conn, self.db_path, self.log)
+                if upgraded:
+                    self._backfill_v2()
+                else:
+                    # Cheap repair path for interrupted upgrades.
+                    if self._query(
+                        "SELECT COUNT(*) AS n FROM factors WHERE signal_hash IS NULL"
+                    )[0]["n"]:
+                        self._backfill_v2()
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                    ("schema_version", str(SCHEMA_VERSION)),
+                )
                 self._conn.commit()
             except sqlite3.Error as exc:
                 raise StorageError(f"cannot initialize registry schema: {exc}") from exc
@@ -317,16 +406,26 @@ class FactorRegistry:
             features.fields, features.operators, resolver=self.resolver
         )
         combinations = self._combinations_for(canonical)
+        signal = expression_hash(canonical)
 
         return {
             "exact_hash": exact,
+            # experiment_hash: same expression under the same normalized
+            # settings — intentionally identical to the historical exact_hash.
+            "experiment_hash": exact,
+            # signal_hash: expression identity alone, independent of settings.
+            "signal_hash": signal,
             "canonical": canonical,
             "template_hash": _sha256(features.template + _HASH_SEPARATOR + scope),
             "structure_hash": _sha256(features.structure),
+            "family_template_hash": _sha256(
+                features.family_template + _HASH_SEPARATOR + scope
+            ),
             "field_template": features.field_template,
             "family_template": features.family_template,
             "features": features,
             "field_family": primary_family,
+            "field_families": families,
             "factor_family": factor_family,
             "combinations": combinations,
             "scope_settings": {
@@ -364,6 +463,9 @@ class FactorRegistry:
         parent_factor_id: int | None = None,
         brain_alpha_id: str | None = None,
         brain_simulation_id: str | None = None,
+        ablation_group_id: str | None = None,
+        changed_parameters: dict[str, Any] | None = None,
+        parent_experiment_id: int | None = None,
     ) -> RegisteredCandidate:
         """Insert a GENERATED candidate, or return the existing factor. Idempotent."""
         fp = self.fingerprints(expression, settings)
@@ -392,6 +494,12 @@ class FactorRegistry:
 
         scope = fp["scope_settings"]
         now = utcnow_iso()
+        theme = classify_theme(
+            fp["features"].fields,
+            fp["features"].operators,
+            resolver=self.resolver,
+        )
+        theme_parts = (theme or "").split(".")
         cursor = self._execute(
             """
             INSERT INTO factors (
@@ -399,8 +507,12 @@ class FactorRegistry:
                 template_hash, structure_hash, field_template, family_template,
                 status, region, universe, delay, decay, neutralization, truncation,
                 settings_json, created_at, brain_alpha_id, brain_simulation_id,
-                source, parent_factor_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source, parent_factor_id,
+                signal_hash, experiment_hash, family_template_hash,
+                ablation_group_id, changed_parameters_json, parent_experiment_id,
+                theme, branch, subtheme
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 exact_hash, expression, fp["canonical"],
@@ -412,10 +524,19 @@ class FactorRegistry:
                 _dumps(fp["settings"]), now,
                 brain_alpha_id or None, brain_simulation_id or None,
                 source, parent_factor_id,
+                fp["signal_hash"], fp["experiment_hash"], fp["family_template_hash"],
+                ablation_group_id,
+                _dumps(changed_parameters) if changed_parameters else None,
+                parent_experiment_id,
+                theme_parts[0] if theme_parts else None,
+                theme_parts[1] if len(theme_parts) > 1 else None,
+                theme_parts[2] if len(theme_parts) > 2 else None,
             ),
         )
         factor_id = int(cursor.lastrowid)
         self._save_features(factor_id, fp)
+        self._save_subtrees(factor_id, fp)
+        self._record_combo_legs(factor_id, fp)
         return RegisteredCandidate(
             factor_id=factor_id, created=True, exact_hash=exact_hash,
             status=FactorStatus.GENERATED,
@@ -425,25 +546,109 @@ class FactorRegistry:
         f = fp["features"]
         combo_keys = [combo.key for combo in fp["combinations"]]
         feature_json = f.to_feature_json()
-        feature_json["field_families"] = [
+        field_families = fp.get("field_families") or [
             self.resolver(name) for name in f.fields
         ]
+        feature_json["field_families"] = field_families
         self._execute(
             """
             INSERT OR REPLACE INTO factor_features (
                 factor_id, operators_json, fields_json, windows_json,
                 operator_count, field_count, tree_depth, root_operator,
                 factor_family, field_family, assigned_locals_json,
-                combination_keys_json, feature_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                combination_keys_json, feature_json,
+                operator_paths_json, operator_multiset_json, field_families_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 factor_id, _dumps(f.operators), _dumps(f.fields), _dumps(f.windows),
                 f.operator_count, f.field_count, f.tree_depth, f.root_operator,
                 fp["factor_family"], fp["field_family"],
                 _dumps(f.assigned_locals), _dumps(combo_keys), _dumps(feature_json),
+                _dumps(f.operator_paths), _dumps(f.operator_multiset),
+                _dumps(field_families),
             ),
         )
+
+    def _save_subtrees(self, factor_id: int, fp: dict[str, Any]) -> None:
+        """Persist per-leg fingerprints of every blend/group subtree."""
+        self._execute(
+            "DELETE FROM factor_subtrees WHERE factor_id = ?", (factor_id,)
+        )
+        subtrees = fp["features"].subtrees or []
+        for subtree_index, subtree in enumerate(subtrees):
+            for leg in subtree.get("legs", []):
+                leg_fields = leg.get("fields") or []
+                leg_families = [self.resolver(name) for name in leg_fields]
+                leg_family = (
+                    max(set(leg_families), key=leg_families.count)
+                    if leg_families else "UNKNOWN"
+                )
+                self._execute(
+                    """
+                    INSERT OR REPLACE INTO factor_subtrees (
+                        factor_id, subtree_index, node_label, leg_index,
+                        leg_family, leg_template_hash, leg_structure_hash,
+                        leg_template, leg_structure
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        factor_id, subtree_index, subtree.get("node"),
+                        leg.get("index", 0), leg_family,
+                        _sha256(leg.get("template", "")),
+                        _sha256(leg.get("structure", "")),
+                        leg.get("template"), leg.get("structure"),
+                    ),
+                )
+
+    def _record_combo_legs(self, factor_id: int, fp: dict[str, Any]) -> None:
+        """Attach this factor's per-leg hashes to its combination rows."""
+        # Map node label -> ordered leg (template_hash, structure_hash).
+        legs_by_node: dict[str, list[dict[str, str]]] = {}
+        for subtree in fp["features"].subtrees or []:
+            node = str(subtree.get("node", "")).lower()
+            legs_by_node.setdefault(node, []).append(
+                {
+                    "template_hash": _sha256(
+                        subtree["legs"][0].get("template", "")
+                        if subtree.get("legs") else ""
+                    ),
+                    "structure_hash": _sha256(
+                        subtree["legs"][0].get("structure", "")
+                        if subtree.get("legs") else ""
+                    ),
+                }
+            )
+        rows = self._query(
+            "SELECT combination_key FROM factor_combinations"
+        )
+        existing = {row["combination_key"] for row in rows}
+        for combo in fp["combinations"]:
+            if combo.key not in existing:
+                continue
+            left = getattr(combo, "left_leg", None)
+            right = getattr(combo, "right_leg", None)
+            if left is None and right is None:
+                continue
+            self._execute(
+                """
+                UPDATE factor_combinations SET
+                    left_template_hash = COALESCE(left_template_hash, ?),
+                    right_template_hash = COALESCE(right_template_hash, ?),
+                    left_structure_hash = COALESCE(left_structure_hash, ?),
+                    right_structure_hash = COALESCE(right_structure_hash, ?),
+                    structure_hash = COALESCE(structure_hash, ?)
+                WHERE combination_key = ?
+                """,
+                (
+                    left.get("template_hash") if left else None,
+                    right.get("template_hash") if right else None,
+                    left.get("structure_hash") if left else None,
+                    right.get("structure_hash") if right else None,
+                    combo.structure_hash if getattr(combo, "structure_hash", None) else None,
+                    combo.key,
+                ),
+            )
 
     # ------------------------------------------------------------------ #
     # Status transitions
@@ -501,6 +706,55 @@ class FactorRegistry:
         self.set_status(
             factor_id, FactorStatus.CORR_REJECTED, rejection_reason=decision.reason
         )
+        self._execute(
+            """
+            UPDATE factors SET
+                failure_category = ?,
+                corr_status = ?,
+                corr_band = ?,
+                corr_margin = ?,
+                high_quality_redundant = ?
+            WHERE id = ?
+            """,
+            (
+                _FAILURE_SELF_CORRELATION,
+                CorrelationStatus.FAIL.value,
+                decision.band.value if decision.band else None,
+                decision.corr_margin,
+                1 if self._is_high_quality(factor_id) else 0,
+                factor_id,
+            ),
+        )
+
+    def _is_high_quality(self, factor_id: int) -> bool:
+        """A corr-rejected factor may still be a strong, worth-keeping idea."""
+        memory = self.config.memory
+        metrics = self.get_metrics(factor_id) or {}
+        sharpe = metrics.get("sharpe")
+        fitness = metrics.get("fitness")
+        if sharpe is None or fitness is None:
+            return False
+        return (
+            float(sharpe) >= memory.high_quality_min_sharpe
+            and float(fitness) >= memory.high_quality_min_fitness
+        )
+
+    def get_high_quality_redundant(
+        self, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Strong signals that lost only to correlation — keep idea, switch data."""
+        rows = self._query(
+            """
+            SELECT f.id, f.expression, f.family_template, f.corr_margin,
+                   f.rejection_reason, m.sharpe, m.fitness, m.turnover
+            FROM factors f LEFT JOIN factor_metrics m ON m.factor_id = f.id
+            WHERE f.high_quality_redundant = 1
+            ORDER BY COALESCE(m.fitness, 0) DESC, COALESCE(m.sharpe, 0) DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
 
     def mark_submitted(
         self, factor_id: int, *, brain_alpha_id: str | None = None
@@ -555,6 +809,10 @@ class FactorRegistry:
                 rejection_reason=str(reason)[:500],
                 brain_alpha_id=brain_alpha_id,
                 brain_simulation_id=brain_simulation_id,
+            )
+            self._execute(
+                "UPDATE factors SET failure_category = ? WHERE id = ?",
+                (_FAILURE_SIM_ERROR, factor_id),
             )
             if first_completion:
                 self._bump_combo_counters(factor_id, trial_delta=1)
@@ -611,10 +869,31 @@ class FactorRegistry:
         if metric_passed:
             self.set_status(factor_id, FactorStatus.SIMULATED)
         else:
-            reasons = getattr(result, "reasons", None) or [
+            reasons_list = getattr(result, "reasons", None) or [
                 "did not pass configured metric filters"
             ]
-            self.mark_metric_rejected(factor_id, list(reasons))
+            self.mark_metric_rejected(factor_id, list(reasons_list))
+            memory = self.config.memory
+            assessment = classify_failure(
+                status=FactorStatus.METRIC_REJECTED,
+                checks=checks,
+                reasons=[str(r) for r in reasons_list],
+                sharpe=getattr(result, "sharpe", None),
+                fitness=getattr(result, "fitness", None),
+                long_count=getattr(result, "long_count", None),
+                short_count=getattr(result, "short_count", None),
+                train_sharpe=getattr(result, "sharpe", None),
+                test_sharpe=(
+                    test_stats.get("sharpe") if isinstance(test_stats, dict) else None
+                ),
+                one_sided_ratio=memory.one_sided_book_ratio,
+                overfit_retention=memory.overfit_test_retention,
+                overfit_min_train_sharpe=memory.overfit_min_train_sharpe,
+            )
+            self._execute(
+                "UPDATE factors SET failure_category = ? WHERE id = ?",
+                (assessment.primary, factor_id),
+            )
 
         if first_completion:
             self._bump_combo_counters(
@@ -625,6 +904,7 @@ class FactorRegistry:
             # Fold Sharpe/Fitness into per-combination avg/best exactly once,
             # when the first completed metrics land (not on re-imports).
             self._record_combo_performance(factor_id)
+            self._backfill_combo_legs([factor_id])
         return factor_id
 
     def handle_completed(
@@ -658,6 +938,13 @@ class FactorRegistry:
                     )
                 if apply_gate and self.config.correlation.enabled and (records or max_self is not None):
                     decision = self.apply_correlation_gate(factor_id)
+                elif apply_gate and self.config.correlation.enabled:
+                    # Metric-passed but no correlation evidence at all: record
+                    # UNKNOWN explicitly (factor stays SIMULATED, never PASSED).
+                    self._execute(
+                        "UPDATE factors SET corr_status = ? WHERE id = ?",
+                        (CorrelationStatus.UNKNOWN.value, factor_id),
+                    )
             return {
                 "factor_id": factor_id,
                 "status": self.get_factor(factor_id)["status"],
@@ -749,14 +1036,38 @@ class FactorRegistry:
         factor = self.get_factor(factor_id)
         if factor and factor["status"] in (FactorStatus.SIMULATED, FactorStatus.PASSED):
             previous_passed = factor["status"] == FactorStatus.PASSED
-            if decision.passed:
+            if decision.status is CorrelationStatus.PASS:
                 self.set_status(factor_id, FactorStatus.PASSED)
                 if not previous_passed:
                     self._bump_combo_counters(factor_id, corr_pass_delta=1)
                 if decision.max_abs_corr is not None:
                     self._update_combo_corr(factor_id, decision.max_abs_corr)
-            else:
+                self._execute(
+                    """
+                    UPDATE factors SET corr_status = ?, corr_band = ?,
+                        corr_margin = ?, failure_category = NULL
+                    WHERE id = ?
+                    """,
+                    (
+                        CorrelationStatus.PASS.value,
+                        decision.band.value,
+                        decision.corr_margin,
+                        factor_id,
+                    ),
+                )
+            elif decision.status is CorrelationStatus.FAIL:
                 self.mark_corr_rejected(factor_id, decision)
+            else:
+                # UNKNOWN: no usable evidence. Do NOT promote to PASSED and do
+                # NOT reject — the factor stays SIMULATED awaiting corr data.
+                self._execute(
+                    """
+                    UPDATE factors SET corr_status = ?, corr_band = NULL,
+                        corr_margin = NULL
+                    WHERE id = ?
+                    """,
+                    (CorrelationStatus.UNKNOWN.value, factor_id),
+                )
         return decision
 
     def get_nearest_correlated_factors(
@@ -916,6 +1227,99 @@ class FactorRegistry:
         rows = self._query("SELECT * FROM factors WHERE exact_hash = ?", (exact,))
         return dict(rows[0]) if rows else None
 
+    # ------------------------------------------------------------------ #
+    # v2 identity layer: signal / experiment / family-template
+    # ------------------------------------------------------------------ #
+    def find_signal(
+        self, signal_hash: str, *, statuses: Iterable[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Every experiment (settings variant) ever recorded for one signal."""
+        sql = "SELECT * FROM factors WHERE signal_hash = ?"
+        params: list[Any] = [signal_hash]
+        status_list = list(statuses) if statuses else None
+        if status_list:
+            sql += f" AND status IN ({','.join('?' for _ in status_list)})"
+            params.extend(status_list)
+        sql += " ORDER BY id"
+        return [dict(row) for row in self._query(sql, params)]
+
+    def signal_experiments(
+        self,
+        expression: str,
+        settings: dict[str, Any] | None = None,
+        *,
+        statuses: Iterable[str] | None = FactorStatus.KNOWLEDGE_SET,
+    ) -> list[dict[str, Any]]:
+        """Prior researched experiments sharing this signal (expr identity)."""
+        fp = self.fingerprints(expression, settings)
+        return self.find_signal(fp["signal_hash"], statuses=statuses)
+
+    def count_signal_experiments(self, signal_hash: str) -> int:
+        rows = self._query(
+            "SELECT COUNT(*) AS n FROM factors WHERE signal_hash = ? "
+            "AND status != ?",
+            (signal_hash, FactorStatus.GENERATED),
+        )
+        return int(rows[0]["n"])
+
+    def family_template_trial_count(self, family_template_hash: str) -> int:
+        """How often this family-level template (same FAMILY tokens + scope) ran."""
+        rows = self._query(
+            "SELECT COUNT(*) AS n FROM factors WHERE family_template_hash = ? "
+            "AND status != ?",
+            (family_template_hash, FactorStatus.GENERATED),
+        )
+        return int(rows[0]["n"])
+
+    def subtree_matches(
+        self,
+        leg_template_hashes: Iterable[str] | None = None,
+        leg_structure_hashes: Iterable[str] | None = None,
+        *,
+        statuses: Iterable[str] | None = FactorStatus.RESEARCH_SET,
+    ) -> list[dict[str, Any]]:
+        """Factors sharing any per-leg fingerprint (subtree-level dedup)."""
+        status_list = list(statuses) if statuses else []
+        clauses: list[str] = []
+        params: list[Any] = []
+        templates = [h for h in (leg_template_hashes or []) if h]
+        structures = [h for h in (leg_structure_hashes or []) if h]
+        if templates:
+            clauses.append(
+                f"leg_template_hash IN ({','.join('?' for _ in templates)})"
+            )
+            params.extend(templates)
+        if structures:
+            clauses.append(
+                f"leg_structure_hash IN ({','.join('?' for _ in structures)})"
+            )
+            params.extend(structures)
+        if not clauses:
+            return []
+        sql = (
+            "SELECT DISTINCT s.factor_id, s.node_label, s.leg_index, s.leg_family, "
+            "f.expression, f.status FROM factor_subtrees s "
+            "JOIN factors f ON f.id = s.factor_id WHERE ("
+            + " OR ".join(clauses) + ")"
+        )
+        if status_list:
+            sql += f" AND f.status IN ({','.join('?' for _ in status_list)})"
+            params.extend(status_list)
+        return [dict(row) for row in self._query(sql, params)]
+
+    def find_subtree_neighbors(self, fp: dict[str, Any]) -> list[dict[str, Any]]:
+        """Factors matching any leg of the candidate's blend/group subtrees."""
+        template_hashes: set[str] = set()
+        structure_hashes: set[str] = set()
+        for subtree in fp["features"].subtrees or []:
+            for leg in subtree.get("legs", []):
+                template_hashes.add(_sha256(leg.get("template", "")))
+                structure_hashes.add(_sha256(leg.get("structure", "")))
+        return self.subtree_matches(
+            leg_template_hashes=template_hashes,
+            leg_structure_hashes=structure_hashes,
+        )
+
     def get_factor(self, factor_id: int) -> dict[str, Any] | None:
         rows = self._query("SELECT * FROM factors WHERE id = ?", (factor_id,))
         return dict(rows[0]) if rows else None
@@ -938,13 +1342,41 @@ class FactorRegistry:
             data[key.replace("_json", "")] = _loads(data.pop(key), [])
         return data
 
+    def _row_similarity_inputs(
+        self, row: sqlite3.Row | dict[str, Any]
+    ) -> dict[str, Any]:
+        """Parse every feature column a similarity comparison needs."""
+        data = dict(row)
+        feature_json = _loads(data.get("feature_json"), {}) or {}
+        data["operators"] = set(_loads(data.get("operators_json"), []))
+        data["fields_list"] = _loads(data.get("fields_json"), [])
+        data["windows_list"] = _loads(data.get("windows_json"), [])
+        data["combo_keys"] = _loads(data.get("combination_keys_json"), [])
+        data["paths"] = _loads(
+            data.get("operator_paths_json"),
+            feature_json.get("operator_paths", []),
+        )
+        multiset = _loads(
+            data.get("operator_multiset_json"),
+            feature_json.get("operator_multiset", {}),
+        )
+        data["multiset"] = dict(multiset or {})
+        families = _loads(
+            data.get("field_families_json"),
+            feature_json.get("field_families"),
+        )
+        data["families"] = list(families or [])
+        return data
+
     def _factors_with_features(
         self, *, statuses: Iterable[str] | None = None
     ) -> list[dict[str, Any]]:
         sql = (
             "SELECT f.*, ff.operators_json, ff.fields_json, ff.windows_json, "
             "ff.root_operator AS feat_root, ff.tree_depth AS feat_depth, "
-            "ff.factor_family AS feat_family, ff.combination_keys_json "
+            "ff.factor_family AS feat_family, ff.combination_keys_json, "
+            "ff.operator_paths_json, ff.operator_multiset_json, "
+            "ff.field_families_json, ff.feature_json "
             "FROM factors f LEFT JOIN factor_features ff ON ff.factor_id = f.id"
         )
         params: list[Any] = []
@@ -952,16 +1384,32 @@ class FactorRegistry:
         if status_list:
             sql += f" WHERE f.status IN ({','.join('?' for _ in status_list)})"
             params.extend(status_list)
-        rows = self._query(sql, params)
-        result = []
-        for row in rows:
-            data = dict(row)
-            data["operators"] = set(_loads(row["operators_json"], []))
-            data["fields_list"] = _loads(row["fields_json"], [])
-            data["windows_list"] = _loads(row["windows_json"], [])
-            data["combo_keys"] = _loads(row["combination_keys_json"], [])
-            result.append(data)
-        return result
+        return [self._row_similarity_inputs(row) for row in self._query(sql, params)]
+
+    def _similarity_against(
+        self, fp: dict[str, Any], row: dict[str, Any]
+    ) -> float:
+        f = fp["features"]
+        return overall_similarity(
+            structure_equal=row["structure_hash"] == fp["structure_hash"],
+            operators_a=set(f.operators),
+            operators_b=row["operators"],
+            root_a=f.root_operator,
+            root_b=row.get("feat_root") or "",
+            depth_a=f.tree_depth,
+            depth_b=row.get("feat_depth") or 0,
+            fields_a={name.lower() for name in f.fields},
+            fields_b={name.lower() for name in row["fields_list"]},
+            windows_a=f.windows,
+            windows_b=row["windows_list"],
+            families_a=fp.get("field_families"),
+            families_b=row.get("families"),
+            multiset_a=f.operator_multiset,
+            multiset_b=row.get("multiset"),
+            paths_a=f.operator_paths,
+            paths_b=row.get("paths"),
+            config=self.config.similarity,
+        )
 
     def find_similar(
         self,
@@ -970,29 +1418,27 @@ class FactorRegistry:
         *,
         top_k: int = 20,
         statuses: Iterable[str] | None = FactorStatus.RESEARCH_SET,
+        use_index: bool = True,
     ) -> list[SimilarFactor]:
+        """Nearest researched factors.
+
+        ``use_index=True`` (default) scores only the hash-prefiltered pool and
+        scales to tens of thousands of rows; ``use_index=False`` is the
+        exhaustive debug mode.
+        """
         fp = self.fingerprints(expression, settings)
-        f = fp["features"]
+        if use_index:
+            pool = self.research_neighbors(fp, statuses=statuses)
+        else:
+            pool = self._factors_with_features(statuses=statuses)
         scored: list[SimilarFactor] = []
-        for row in self._factors_with_features(statuses=statuses):
-            similarity = overall_similarity(
-                structure_equal=row["structure_hash"] == fp["structure_hash"],
-                operators_a=set(f.operators),
-                operators_b=row["operators"],
-                root_a=f.root_operator,
-                root_b=row["feat_root"] or "",
-                depth_a=f.tree_depth,
-                depth_b=row["feat_depth"] or 0,
-                fields_a={name.lower() for name in f.fields},
-                fields_b={name.lower() for name in row["fields_list"]},
-                windows_a=f.windows,
-                windows_b=row["windows_list"],
-            )
+        for row in pool:
+            similarity = self._similarity_against(fp, row)
             scored.append(
                 SimilarFactor(
                     factor_id=row["id"], expression=row["expression"],
                     status=row["status"], similarity=similarity,
-                    factor_family=row["feat_family"],
+                    factor_family=row.get("feat_family"),
                     brain_alpha_id=row["brain_alpha_id"],
                 )
             )
@@ -1004,15 +1450,17 @@ class FactorRegistry:
         fp: dict[str, Any],
         *,
         statuses: Iterable[str] | None = FactorStatus.RESEARCH_SET,
-        limit: int = 300,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Index-backed candidate prefilter for similarity/novelty.
 
         Rather than scanning every expression, the candidate set is the union
-        of (a) identical template/structure hashes, (b) the same factor family
-        and (c) rows sharing at least one concrete data field. Fine-grained
-        feature comparison happens in Python only on this subset.
+        of (a) identical template/structure hashes, (b) identical
+        family-template hash, (c) the same factor family and (d) rows sharing
+        at least one concrete data field. Fine-grained feature comparison
+        happens in Python only on this subset.
         """
+        pool_limit = limit or self.config.memory.neighbor_pool_limit
         status_list = list(statuses) if statuses else []
         status_clause = (
             f"AND f.status IN ({','.join('?' for _ in status_list)})"
@@ -1031,6 +1479,10 @@ class FactorRegistry:
 
         add_arm("f.template_hash = ?", [fp["template_hash"]])
         add_arm("f.structure_hash = ?", [fp["structure_hash"]])
+        if fp.get("family_template_hash"):
+            add_arm(
+                "f.family_template_hash = ?", [fp["family_template_hash"]]
+            )
         family = fp.get("factor_family")
         if family and family != "UNKNOWN":
             add_arm("ff.factor_family = ?", [family])
@@ -1044,28 +1496,22 @@ class FactorRegistry:
                 [f'%"{name.lower()}"%' for name in fields],
             )
 
-        union_sql = " UNION ".join(arms)
+        union_sql = " UNION ".join(arms) if arms else "SELECT 0 WHERE 0"
         rows = self._query(
             f"""
             SELECT f.*, ff.operators_json, ff.fields_json, ff.windows_json,
                    ff.root_operator AS feat_root, ff.tree_depth AS feat_depth,
-                   ff.factor_family AS feat_family, ff.combination_keys_json
+                   ff.factor_family AS feat_family, ff.combination_keys_json,
+                   ff.operator_paths_json, ff.operator_multiset_json,
+                   ff.field_families_json, ff.feature_json
             FROM factors f
             LEFT JOIN factor_features ff ON ff.factor_id = f.id
             WHERE f.id IN ({union_sql})
             LIMIT ?
             """,
-            (*arm_params, limit),
+            (*arm_params, pool_limit),
         )
-        result = []
-        for row in rows:
-            data = dict(row)
-            data["operators"] = set(_loads(row["operators_json"], []))
-            data["fields_list"] = _loads(row["fields_json"], [])
-            data["windows_list"] = _loads(row["windows_json"], [])
-            data["combo_keys"] = _loads(row["combination_keys_json"], [])
-            result.append(data)
-        return result
+        return [self._row_similarity_inputs(row) for row in rows]
 
     def get_factors_by_status(self, status: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM factors WHERE status = ? ORDER BY id DESC"
@@ -1206,3 +1652,369 @@ class FactorRegistry:
             (f'%"{field_name.lower()}"%',),
         )
         return int(rows[0]["n"])
+
+    # ------------------------------------------------------------------ #
+    # Public candidate evaluation (read-only; generators never touch SQL)
+    # ------------------------------------------------------------------ #
+    def evaluate_candidate(
+        self,
+        expression: str,
+        settings: dict[str, Any] | None = None,
+        *,
+        force: bool = False,
+        source: str | None = None,
+        ablation_group_id: str | None = None,
+        changed_parameters: dict[str, Any] | None = None,
+        parent_experiment_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Four-level duplicate + novelty verdict as plain JSON-serializable data.
+
+        Levels:
+            L0 exact experiment (expr + settings)      -> hard reject
+            L1 same signal, different settings         -> penalty / skip
+            L2 family/template saturation              -> novelty penalty
+            L3 structural neighbours (incl. subtrees)   -> novelty score
+        """
+        from .gates import (
+            ACTION_REJECT_EXACT,
+            ACTION_SIMULATE,
+            ACTION_SKIP_LOW_NOVELTY,
+            ACTION_SKIP_SIGNAL_DUPLICATE,
+            calculate_novelty,
+        )
+
+        source = source or "generator"
+        is_ablation = source == "ablation" or bool(ablation_group_id)
+        fp = self.fingerprints(expression, settings)
+        cfg = self.config
+        warnings: list[str] = []
+
+        # --- L0: exact experiment -----------------------------------------
+        exact_row = self.find_exact(expression, settings)
+        experiment_duplicate = exact_row is not None
+
+        # --- L1: same signal, different settings --------------------------
+        prior = self.find_signal(
+            fp["signal_hash"], statuses=FactorStatus.KNOWLEDGE_SET
+        )
+        prior = [row for row in prior if not experiment_duplicate or row["id"] != (exact_row or {}).get("id")]
+        signal_trials = self.count_signal_experiments(fp["signal_hash"])
+        same_signal = signal_trials > 0
+        if same_signal:
+            ids = [row["id"] for row in prior] or (
+                [int(exact_row["id"])] if exact_row else []
+            )
+            warnings.append(
+                f"same canonical expression already has {signal_trials} experiment(s): "
+                f"factor ids {ids[:8]}"
+            )
+
+        # --- L2: template / family-template saturation --------------------
+        template_trials = self.template_trial_count(fp["template_hash"])
+        family_template_trials = self.family_template_trial_count(
+            fp["family_template_hash"]
+        )
+        subtree_neighbors = self.find_subtree_neighbors(fp)
+        if subtree_neighbors:
+            warnings.append(
+                f"{len(subtree_neighbors)} prior factor(s) share a blend/group leg"
+            )
+
+        # --- L3: structural novelty (with same-signal penalty) -------------
+        novelty = calculate_novelty(
+            self,
+            expression,
+            settings,
+            same_signal=same_signal and not is_ablation,
+            signal_trials=signal_trials,
+        )
+        nearest_factor = None
+        nearest_cluster = None
+        if novelty.nearest_factor_id is not None:
+            nearest_factor = {
+                "factor_id": novelty.nearest_factor_id,
+                "similarity": novelty.nearest_similarity,
+            }
+            nf = self.get_factor(novelty.nearest_factor_id)
+            if nf:
+                nearest_factor["expression"] = nf.get("expression")
+                nearest_factor["status"] = nf.get("status")
+            nearest_cluster = self._cluster_of(novelty.nearest_factor_id)
+
+        # --- Decision ------------------------------------------------------
+        action = ACTION_SIMULATE
+        reasons: list[str] = []
+        if experiment_duplicate and cfg.pre_simulation.reject_exact_duplicate and not force:
+            action = ACTION_REJECT_EXACT
+            reasons.append(
+                f"exact experiment already recorded as factor#{exact_row['id']}"
+                if exact_row else "exact experiment already recorded"
+            )
+        elif (
+            not force
+            and not is_ablation
+            and same_signal
+            and signal_trials >= cfg.pre_simulation.max_signal_experiments
+        ):
+            action = ACTION_SKIP_SIGNAL_DUPLICATE
+            reasons.append(
+                f"same signal already researched {signal_trials} times "
+                f"(>= {cfg.pre_simulation.max_signal_experiments}); change data/legs, "
+                "not truncation/decay/window (use source='ablation' for a deliberate sweep)"
+            )
+        elif (
+            cfg.pre_simulation.reject_if_saturated_and_low_novelty
+            and template_trials >= cfg.pre_simulation.max_template_trials
+            and novelty.score < cfg.pre_simulation.min_novelty
+        ):
+            action = ACTION_SKIP_LOW_NOVELTY
+            reasons.append(
+                f"template tried {template_trials} times and novelty "
+                f"{novelty.score:.1f} < {cfg.pre_simulation.min_novelty:.1f}"
+            )
+
+        if is_ablation and same_signal:
+            warnings.append(
+                "ablation run: same-signal skip suppressed by design"
+            )
+        if force and (experiment_duplicate or action != ACTION_SIMULATE):
+            warnings.append("force=true: duplicate/saturation reject overridden")
+        if not reasons:
+            reasons.append(
+                f"novelty {novelty.score:.1f}; signal_trials={signal_trials}; "
+                f"template_trials={template_trials}; "
+                f"family_template_trials={family_template_trials}"
+            )
+
+        return {
+            "action": action,
+            "expression": fp["canonical"],
+            "level": action,
+            "reason": "; ".join(reasons),
+            "warnings": warnings,
+            "experiment_duplicate": experiment_duplicate,
+            "experiment_factor_id": int(exact_row["id"]) if exact_row else None,
+            "signal_duplicate": same_signal,
+            "same_signal": same_signal,
+            "signal_trials": signal_trials,
+            "previous_experiments": [row["id"] for row in prior][:20],
+            "template_trials": template_trials,
+            "family_template_trials": family_template_trials,
+            "subtree_neighbor_count": len(subtree_neighbors),
+            "novelty": novelty.to_dict(),
+            "nearest_factor": nearest_factor,
+            "nearest_similarity": novelty.nearest_similarity,
+            "nearest_cluster": nearest_cluster,
+            "ablation": {
+                "is_ablation": is_ablation,
+                "ablation_group_id": ablation_group_id,
+                "changed_parameters": changed_parameters,
+                "parent_experiment_id": parent_experiment_id,
+            },
+            "hashes": {
+                "signal_hash": fp["signal_hash"],
+                "experiment_hash": fp["experiment_hash"],
+                "exact_hash": fp["exact_hash"],
+                "template_hash": fp["template_hash"],
+                "family_template_hash": fp["family_template_hash"],
+                "structure_hash": fp["structure_hash"],
+            },
+        }
+
+    def _cluster_of(self, factor_id: int) -> dict[str, Any] | None:
+        """Small cluster descriptor for one factor (nearest-factor context)."""
+        try:
+            from .clusters import get_clusters
+
+            for cluster in get_clusters(self, min_size=2):
+                if factor_id in cluster.factor_ids:
+                    return {
+                        "cluster_id": cluster.cluster_id,
+                        "representative_id": cluster.representative_id,
+                        "size": cluster.size,
+                        "submitted_count": cluster.submitted_count,
+                    }
+        except Exception as exc:  # noqa: BLE001 - enrichment must never block
+            self.log.debug("cluster lookup failed: %s", exc)
+        return None
+
+    # ------------------------------------------------------------------ #
+    # v2 backfill (parser-dependent part of the migration)
+    # ------------------------------------------------------------------ #
+    def _backfill_v2(self) -> None:
+        """Populate v2 columns for pre-v2 rows without touching their history."""
+        rows = self._query(
+            "SELECT id FROM factors ORDER BY id"
+        )
+        factor_ids = [int(row["id"]) for row in rows]
+        if not factor_ids:
+            return
+        self.log.info("backfilling v2 fingerprints for %d factors", len(factor_ids))
+        for factor_id in factor_ids:
+            try:
+                self._backfill_one_factor(factor_id)
+            except Exception as exc:  # noqa: BLE001 - one bad row must not abort
+                self.log.warning("v2 backfill skipped factor#%d: %s", factor_id, exc)
+        self._backfill_combo_legs(factor_ids)
+        self._backfill_corr_states(factor_ids)
+        self._backfill_cluster_links()
+
+    def _backfill_one_factor(self, factor_id: int) -> None:
+        factor = self.get_factor(factor_id)
+        if not factor:
+            return
+        settings = _loads(factor.get("settings_json"), {})
+        fp = self.fingerprints(factor["expression"], settings)
+
+        theme = classify_theme(
+            fp["features"].fields,
+            fp["features"].operators,
+            resolver=self.resolver,
+        )
+        parts = (theme or "").split(".")
+        self._execute(
+            """
+            UPDATE factors SET
+                signal_hash = COALESCE(signal_hash, ?),
+                experiment_hash = COALESCE(experiment_hash, exact_hash),
+                family_template_hash = COALESCE(family_template_hash, ?),
+                theme = COALESCE(theme, ?),
+                branch = COALESCE(branch, ?),
+                subtheme = COALESCE(subtheme, ?)
+            WHERE id = ?
+            """,
+            (
+                fp["signal_hash"], fp["family_template_hash"],
+                parts[0] if parts else None,
+                parts[1] if len(parts) > 1 else None,
+                parts[2] if len(parts) > 2 else None,
+                factor_id,
+            ),
+        )
+        self._save_features(factor_id, fp)
+        self._save_subtrees(factor_id, fp)
+
+        if factor.get("failure_category"):
+            return
+        category: str | None = None
+        status = factor["status"]
+        if status == FactorStatus.CORR_REJECTED:
+            category = _FAILURE_SELF_CORRELATION
+        elif status == FactorStatus.SIMULATION_FAILED:
+            category = _FAILURE_SIM_ERROR
+        elif status == FactorStatus.DUPLICATE:
+            category = _FAILURE_DUPLICATE
+        elif status == FactorStatus.METRIC_REJECTED:
+            metrics = self.get_metrics(factor_id) or {}
+            assessment = classify_failure(
+                status=status,
+                reasons=[factor.get("rejection_reason") or ""],
+                sharpe=metrics.get("sharpe"),
+                fitness=metrics.get("fitness"),
+                long_count=metrics.get("long_count"),
+                short_count=metrics.get("short_count"),
+                train_sharpe=metrics.get("sharpe"),
+                test_sharpe=metrics.get("test_sharpe"),
+            )
+            category = assessment.primary
+        if category:
+            self._execute(
+                "UPDATE factors SET failure_category = ? WHERE id = ?",
+                (category, factor_id),
+            )
+
+        # high_quality_redundant for historical corr rejections.
+        if status == FactorStatus.CORR_REJECTED and self._is_high_quality(factor_id):
+            self._execute(
+                "UPDATE factors SET high_quality_redundant = 1 WHERE id = ?",
+                (factor_id,),
+            )
+
+    def _backfill_combo_legs(self, factor_ids: list[int]) -> None:
+        """Attach per-leg hashes to combination rows (old + new factors)."""
+        for factor_id in factor_ids:
+            try:
+                factor = self.get_factor(factor_id)
+                if not factor:
+                    continue
+                settings = _loads(factor.get("settings_json"), {})
+                fp = self.fingerprints(factor["expression"], settings)
+                for combo in fp["combinations"]:
+                    left = getattr(combo, "left_leg", None)
+                    right = getattr(combo, "right_leg", None)
+                    structure_hash = getattr(combo, "structure_hash", None)
+                    if left is None and right is None:
+                        continue
+                    self._execute(
+                        """
+                        UPDATE factor_combinations SET
+                            left_template_hash = COALESCE(left_template_hash, ?),
+                            right_template_hash = COALESCE(right_template_hash, ?),
+                            left_structure_hash = COALESCE(left_structure_hash, ?),
+                            right_structure_hash = COALESCE(right_structure_hash, ?),
+                            structure_hash = COALESCE(structure_hash, ?)
+                        WHERE combination_key = ?
+                        """,
+                        (
+                            left.get("template_hash") if left else None,
+                            right.get("template_hash") if right else None,
+                            left.get("structure_hash") if left else None,
+                            right.get("structure_hash") if right else None,
+                            structure_hash,
+                            combo.key,
+                        ),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("combo leg backfill failed for #%d: %s", factor_id, exc)
+
+    def _backfill_corr_states(self, factor_ids: list[int]) -> None:
+        """Stamp corr_status/band/margin from stored correlations (history-safe)."""
+        gate = CorrelationGate(self.config.correlation)
+        for factor_id in factor_ids:
+            factor = self.get_factor(factor_id)
+            if not factor or factor.get("corr_status"):
+                continue
+            rows = self._query(
+                """
+                SELECT fc.*, f.status AS other_status
+                FROM factor_correlations fc
+                LEFT JOIN factors f ON f.id = fc.other_factor_id
+                WHERE fc.factor_id = ?
+                """,
+                (factor_id,),
+            )
+            if not rows:
+                continue
+            protected = [
+                dict(row) for row in rows
+                if dict(row).get("other_status") in (
+                    FactorStatus.SUBMITTED, FactorStatus.PASSED, None
+                )
+            ]
+            if not protected:
+                continue
+            decision = gate.evaluate(factor_id, protected)
+            self._execute(
+                "UPDATE factors SET corr_status = ?, corr_band = ?, corr_margin = ? "
+                "WHERE id = ?",
+                (
+                    decision.status.value,
+                    decision.band.value if decision.band else None,
+                    decision.corr_margin,
+                    factor_id,
+                ),
+            )
+
+    def _backfill_cluster_links(self) -> None:
+        try:
+            from .clusters import get_clusters
+
+            for cluster in get_clusters(self, min_size=2):
+                placeholders = ",".join("?" for _ in cluster.factor_ids)
+                self._execute(
+                    f"UPDATE factors SET nearest_cluster_id = ? "
+                    f"WHERE id IN ({placeholders})",
+                    (cluster.cluster_id, *cluster.factor_ids),
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("cluster link backfill failed: %s", exc)

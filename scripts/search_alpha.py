@@ -532,7 +532,15 @@ def main(argv: list[str] | None = None) -> int:
             kept: list[AlphaSpec] = []
             gate_tally: dict[str, int] = {}
             for spec in specs:
-                _, decision = gate_candidate(registry, spec.expression, spec.settings)
+                _, decision = gate_candidate(
+                    registry,
+                    spec.expression,
+                    spec.settings,
+                    source=getattr(spec, "source", None),
+                    force=bool(getattr(spec, "force_gate", False)),
+                    ablation_group_id=getattr(spec, "ablation_group_id", None),
+                    changed_parameters=getattr(spec, "changed_parameters", None),
+                )
                 if decision is None or decision.passed:
                     kept.append(spec)
                 else:

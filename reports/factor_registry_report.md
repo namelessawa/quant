@@ -100,3 +100,46 @@ Successful (at least one submission):
 - id=389 `t = implied_volatility_mean_10 / implied_volatility_mean_60; v = group_zscore(wi` — SELF_CORRELATION_BLOCKED
 - id=385 `t = implied_volatility_mean_10 / implied_volatility_mean_60; v = group_zscore(wi` — SELF_CORRELATION_BLOCKED
 - id=380 `ey = ts_backfill(anl4_ebit_value, 40) / cap; np = ts_backfill(anl4_fs_detail_est` — SELF_CORRELATION_BLOCKED
+
+## 10. Research Coverage
+
+### Underexplored datasets (trials <= 3)
+- _none (or no field catalog loaded)_
+
+### Underexplored operator structures (family templates <= 5)
+- `add(negative(rank(ts_delta(PRICE,<WINDOW>))),rank(ts_std_dev(PRICE,<WINDOW>)))` (1 trial(s))
+- `assign(a,ts_backfill(FUNDAMENTAL,<WINDOW>));assign(g,divide(ts_delta(a,<WINDOW>),a));group_zscore(winsorize(negative(g),std=3.0),GROUP)` (1 trial(s))
+- `assign(b,OTHER);group_zscore(winsorize(ts_mean(subtract(b,ts_mean(b,<WINDOW>)),<WINDOW>),std=3.0),GROUP)` (1 trial(s))
+- `assign(b,divide(ts_mean(OTHER,<WINDOW>),ts_mean(OTHER,<WINDOW>)));group_zscore(winsorize(negative(b),std=3.0),GROUP)` (1 trial(s))
+- `assign(bt,MODEL);group_zscore(winsorize(negative(ts_mean(bt,<WINDOW>)),std=3.0),GROUP)` (1 trial(s))
+- `assign(c,divide(ts_backfill(ANALYST,<WINDOW>),LIQUIDITY));assign(d,divide(ts_backfill(ANALYST,<WINDOW>),LIQUIDITY));assign(s,subtract(c,d));group_zscore(winsorize(ts_mean(subtract(s,ts_mean(s,<WINDOW>)),<WINDOW>),std=3.0),GROUP)` (1 trial(s))
+- `assign(c,group_zscore(winsorize(ts_mean(MODEL,<WINDOW>),std=3.0),GROUP));assign(d,group_zscore(winsorize(negative(ts_mean(PRICE,<WINDOW>)),std=3.0),GROUP));assign(m,group_zscore(winsorize(negative(ts_mean(MODEL,<WINDOW>)),std=3.0),GROUP));group_zscore(winsorize(add(add(add(add(c,c),d),d),m),std=3.0),GROUP)` (1 trial(s))
+- `assign(c,group_zscore(winsorize(ts_mean(MODEL,<WINDOW>),std=3.0),GROUP));assign(d,group_zscore(winsorize(negative(ts_mean(PRICE,<WINDOW>)),std=3.0),GROUP));group_zscore(winsorize(add(add(add(c,c),d),d),std=3.0),GROUP)` (1 trial(s))
+- `assign(c,ts_mean(MODEL,<WINDOW>));group_zscore(winsorize(negative(c),std=3.0),GROUP)` (1 trial(s))
+- `assign(ey,divide(ts_backfill(ANALYST,<WINDOW>),LIQUIDITY));assign(e,divide(ts_backfill(ANALYST,<WINDOW>),LIQUIDITY));assign(s,add(ey,e));group_zscore(winsorize(ts_mean(subtract(s,ts_mean(s,<WINDOW>)),<WINDOW>),std=3.0),GROUP)` (1 trial(s))
+
+### Saturated clusters: 0 (min size 3, avg internal corr >= 0.70)
+- _none_
+
+## 11. DO_NOT_REPEAT — Dead Ends
+
+- _none recorded_
+
+### Failed research directions (by failure category)
+- **Weak standalone signal (sharpe below bar)** — 169 failure(s): OPTION×44, PRICE_REVERSAL×42, MODEL×30
+- **Strong idea but redundant vs an existing alpha/cluster** — 63 failure(s): ANALYST×34, OPTION×29
+- **Simulation itself errored/timed out** — 41 failure(s): OPTION×15, NEWS×12, PRICE_REVERSAL×10
+- **One-sided book (degenerate long/short profile)** — 17 failure(s): MODEL×14, ANALYST×3
+- **Weak risk-adjusted quality (fitness below bar)** — 12 failure(s): OPTION×6, PRICE_REVERSAL×5, ANALYST×1
+- **Great in train, collapses out of sample** — 3 failure(s): OPTION×3
+- **Turns over too fast (cost / capacity)** — 1 failure(s): PRICE_REVERSAL×1
+
+## 12. High-Quality Redundant — Change Data, Not Parameters
+
+- id=284 sharpe=2.34 fitness=2.80 margin=-0.341 `ey = ts_backfill(anl4_ebit_value, 40) / cap; np = ts_backfill(anl4_fs_detail_est`
+- id=314 sharpe=2.24 fitness=2.53 margin=-0.277 `ey = ts_backfill(anl4_ebit_value, 40) / cap; np = ts_backfill(anl4_fs_detail_est`
+- id=299 sharpe=2.34 fitness=2.35 margin=-0.340 `ey = ts_backfill(anl4_ebit_value, 40) / cap; np = ts_backfill(anl4_fs_detail_est`
+- id=283 sharpe=2.34 fitness=2.32 margin=-0.342 `ey = ts_backfill(anl4_ebit_value, 40) / cap; np = ts_backfill(anl4_fs_detail_est`
+- id=306 sharpe=2.34 fitness=2.32 margin=-0.341 `ey = ts_backfill(anl4_ebit_value, 40) / cap; np = ts_backfill(anl4_fs_detail_est`
+
+_Rule: these signals are real. Keep the idea, switch legs/dataset/family — do NOT retune window/decay/truncation._

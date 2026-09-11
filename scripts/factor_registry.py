@@ -11,6 +11,8 @@ stats                 Print total counts and the 10-state distribution.
 migrate               One-way, idempotent seed from data/worldquant.db.
 import-submitted      Pull GET /users/self/alphas and upsert SUBMITTED rows.
 similar               Find research-set factors most similar to an expression.
+explain               Full fingerprint/L0-L3 verdict for a candidate expression.
+why                   Explain why a stored factor was rejected/accepted.
 families              Per-factor-family trial / pass / submission table.
 report                Write a Markdown memory report (reports/ by default).
 
@@ -22,6 +24,8 @@ Examples
     python scripts/factor_registry.py migrate
     python scripts/factor_registry.py import-submitted
     python scripts/factor_registry.py similar --expression "rank(ts_delta(close,21))"
+    python scripts/factor_registry.py explain -e "group_zscore(ts_delta(close,5),subindustry)"
+    python scripts/factor_registry.py why --id 123
     python scripts/factor_registry.py families
     python scripts/factor_registry.py report
 """
@@ -91,6 +95,25 @@ def build_parser() -> argparse.ArgumentParser:
                          help="override one setting (repeatable), e.g. --setting delay=0")
     similar.add_argument("--all-statuses", action="store_true",
                          help="search every status, not just the research set")
+
+    explain = sub.add_parser(
+        "explain", help="fingerprints + L0/L1/L2/L3 verdict for a candidate")
+    explain.add_argument("--expression", "-e", required=True)
+    explain.add_argument("--set-json", default=None,
+                         help="settings as a JSON object")
+    explain.add_argument("--setting", action="append", default=[], metavar="KEY=VALUE",
+                         help="override one setting (repeatable)")
+    explain.add_argument("--source", default=None,
+                         help="candidate source, e.g. 'ablation'")
+    explain.add_argument("--force", action="store_true",
+                         help="evaluate as if hard rejects are overridden")
+    explain.add_argument("--top", "-k", type=int, default=5,
+                         help="nearest factors to show")
+
+    why = sub.add_parser("why", help="explain the fate of a stored factor")
+    why.add_argument("--alpha-id", default=None, help="BRAIN remote alpha id")
+    why.add_argument("--id", dest="factor_id", type=int, default=None,
+                     help="local factor id")
 
     families = sub.add_parser("families", help="factor-family trial/pass table")
     families.add_argument("--min-trials", type=int, default=1)
@@ -192,6 +215,154 @@ def cmd_similar(registry, config, args, log) -> int:
             f"{item.status:<16} fam={item.factor_family or '?':<16} "
             f"{item.expression[:70]}"
         )
+    return EXIT_OK
+
+
+def cmd_explain(registry, config, args, log) -> int:
+    settings = dict(config.settings)
+    if args.set_json:
+        try:
+            payload = json.loads(args.set_json)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"--set-json is not valid JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ConfigError("--set-json must be a JSON object")
+        settings.update(payload)
+    settings.update(parse_setting_overrides(args.setting))
+
+    fp = registry.fingerprints(args.expression, settings)
+    features = fp["features"]
+    verdict = registry.evaluate_candidate(
+        args.expression,
+        settings,
+        source=args.source,
+        force=args.force,
+    )
+    neighbors = registry.find_similar(
+        args.expression, settings,
+        top_k=args.top, statuses=FactorStatus.RESEARCH_SET,
+    )
+
+    recommendation = {
+        "REJECT_EXACT_DUPLICATE": "Already run with identical settings — do NOT re-simulate.",
+        "SKIP_SIGNAL_DUPLICATE": (
+            "Same signal already swept on parameters — change data/legs/family, "
+            "not truncation/decay/window."
+        ),
+        "SKIP_LOW_NOVELTY": "Structure is saturated and novelty is low — pick a new template/dataset.",
+        "SIMULATE": "No blocking duplicate; eligible for simulation.",
+    }.get(verdict["action"], verdict["action"])
+
+    payload = {
+        "expression_input": args.expression,
+        "canonical_expression": fp["canonical"],
+        "scope_settings": fp["scope_settings"],
+        "fingerprints": verdict["hashes"],
+        "templates": {
+            "field_template": fp["field_template"],
+            "family_template": fp["family_template"],
+            "structure_hash": fp["structure_hash"],
+            "structure": features.structure,
+        },
+        "features": {
+            "fields": features.fields,
+            "field_families": fp["field_families"],
+            "factor_family": fp["factor_family"],
+            "operators": features.operators,
+            "operator_multiset": features.operator_multiset,
+            "operator_paths": features.operator_paths,
+            "windows": features.windows,
+            "tree_depth": features.tree_depth,
+            "root_operator": features.root_operator,
+            "subtrees": features.subtrees,
+        },
+        "combinations": [
+            c.to_dict() if hasattr(c, "to_dict") else dict(c)
+            for c in fp["combinations"]
+        ],
+        "gate": verdict,
+        "nearest_factors": [
+            {
+                "factor_id": item.factor_id,
+                "similarity": item.similarity,
+                "status": item.status,
+                "family": item.factor_family,
+                "expression": item.expression,
+            }
+            for item in neighbors
+        ],
+        "recommendation": recommendation,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    return EXIT_OK
+
+
+def cmd_why(registry, config, args, log) -> int:
+    if not args.factor_id and not args.alpha_id:
+        raise ConfigError("why requires --id or --alpha-id")
+    if args.factor_id:
+        factor = registry.get_factor(int(args.factor_id))
+    else:
+        rows = registry._query(
+            "SELECT * FROM factors WHERE brain_alpha_id = ?",
+            (str(args.alpha_id),),
+        )
+        factor = dict(rows[0]) if rows else None
+    if factor is None:
+        print("factor not found", file=sys.stderr)
+        return EXIT_USAGE_ERROR
+
+    factor_id = int(factor["id"])
+    metrics = registry.get_metrics(factor_id)
+    corr_rows = registry.get_nearest_correlated_factors(factor_id, limit=10)
+    settings = json.loads(factor.get("settings_json") or "{}")
+    context = registry.evaluate_candidate(factor["expression"], settings)
+
+    reason_buckets = {
+        "SIMULATION_FAILED": "The simulation itself errored/timed out (see rejection_reason).",
+        "METRIC_REJECTED": f"Metric gate failed: {factor.get('failure_category') or 'see checks/reasons'}.",
+        "CORR_REJECTED": (
+            f"Self-correlation gate ({factor.get('corr_status')}/"
+            f"{factor.get('corr_band')}); strong but redundant — change data/legs."
+            if factor.get("high_quality_redundant")
+            else f"Self-correlation gate rejected it ({factor.get('corr_band')})."
+        ),
+        "DUPLICATE": "Duplicate/saturated-variant block at the pre-simulation gate.",
+        "SIMULATED": "Metrics pass; correlation evidence pending/unknown — not yet submittable.",
+        "PASSED": "Passed all gates.",
+        "SUBMITTED": "Submitted to BRAIN.",
+    }
+
+    payload = {
+        "factor_id": factor_id,
+        "status": factor["status"],
+        "expression": factor["expression"],
+        "canonical_expression": factor["canonical_expression"],
+        "brain_alpha_id": factor.get("brain_alpha_id"),
+        "settings": settings,
+        "failure_category": factor.get("failure_category"),
+        "rejection_reason": factor.get("rejection_reason"),
+        "corr_state": {
+            "status": factor.get("corr_status"),
+            "band": factor.get("corr_band"),
+            "margin_to_limit": factor.get("corr_margin"),
+            "nearest_cluster_id": factor.get("nearest_cluster_id"),
+            "high_quality_redundant": bool(factor.get("high_quality_redundant")),
+        },
+        "metrics": metrics,
+        "nearest_correlations": corr_rows[:5],
+        "memory_context_if_repeated_today": {
+            "action": context["action"],
+            "same_signal": context["same_signal"],
+            "signal_trials": context["signal_trials"],
+            "previous_experiments": context["previous_experiments"],
+            "novelty": context["novelty"],
+            "nearest_cluster": context["nearest_cluster"],
+            "subtree_neighbor_count": context["subtree_neighbor_count"],
+        },
+        "explanation": reason_buckets.get(factor["status"], factor["status"]),
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
     return EXIT_OK
 
 
@@ -405,6 +576,91 @@ def build_markdown_report(registry) -> str:
     else:
         lines.append("- _none_")
     lines.append("")
+
+    ctx = build_generation_context(registry)
+
+    lines.append("## 10. Research Coverage")
+    lines.append("")
+    lines.append("### Underexplored datasets (trials <= 3)")
+    if ctx["underexplored_datasets"]:
+        for row in ctx["underexplored_datasets"]:
+            lines.append(f"- `{row['dataset']}` ({row['trials']} trial(s))")
+    else:
+        lines.append("- _none — no catalog loaded, or every catalog dataset already has >3 trials_")
+    lines.append("")
+    lines.append("### Underexplored operator structures (family templates <= 5)")
+    if ctx["underexplored_operator_structures"]:
+        for row in ctx["underexplored_operator_structures"][:15]:
+            lines.append(f"- `{row['family_template']}` ({row['trials']} trial(s))")
+    else:
+        lines.append("- _none_")
+    lines.append("")
+    saturated_clusters = ctx["saturated_clusters"]
+    lines.append(
+        f"### Saturated clusters: {len(saturated_clusters)} "
+                "(min size 3, avg internal corr >= 0.70)"
+    )
+    if saturated_clusters:
+        lines.append("")
+        lines.append("| Rep | Size | Avg corr | Max corr | Best sharpe | Theme | Families |")
+        lines.append("| ---: | ---: | ---: | ---: | ---: | --- | --- |")
+        for cluster in saturated_clusters[:15]:
+            families = ", ".join(
+                list((cluster.get("family_distribution") or {}).keys())[:3]
+            )
+            lines.append(
+                f"| {cluster['representative_id']} | {cluster['size']} | "
+                f"{_fmt(cluster.get('avg_corr'))} | {_fmt(cluster.get('max_corr'))} | "
+                f"{_fmt(cluster.get('best_sharpe'))} | {cluster.get('theme') or '?'} | "
+                f"{families} |"
+            )
+    else:
+        lines.append("- _none_")
+    lines.append("")
+
+    lines.append("## 11. DO_NOT_REPEAT — Dead Ends")
+    lines.append("")
+    if ctx["do_not_repeat"]:
+        for item in ctx["do_not_repeat"]:
+            lines.append(
+                f"- **[{item['kind']}]** `{item['pattern']}` — {item['reason']} "
+                f"({item['trials']} trial(s), best corr {_fmt(item.get('best_corr'))})"
+            )
+    else:
+        lines.append("- _none recorded_")
+    lines.append("")
+    lines.append("### Failed research directions (by failure category)")
+    if ctx["failed_research_directions"]:
+        for row in ctx["failed_research_directions"]:
+            families = ", ".join(
+                f"{name}×{n}" for name, n in list(row["families"].items())[:3]
+            )
+            lines.append(
+                f"- **{row['label']}** — {row['trials']} failure(s): {families}"
+            )
+    else:
+        lines.append("- _none_")
+    lines.append("")
+
+    lines.append("## 12. High-Quality Redundant — Change Data, Not Parameters")
+    lines.append("")
+    redundant = ctx["high_quality_redundant_examples"]
+    if redundant:
+        for row in redundant[:10]:
+            expr = (row.get("expression") or "").replace("|", "\\|")[:80]
+            lines.append(
+                f"- id={row['factor_id']} sharpe={_fmt(row.get('sharpe'))} "
+                f"fitness={_fmt(row.get('fitness'))} "
+                f"margin={_fmt(row.get('corr_margin'), 3)} `{expr}`"
+            )
+        lines.append("")
+        lines.append(
+            "_Rule: these signals are real. Keep the idea, switch legs/dataset/"
+            "family — do NOT retune window/decay/truncation._"
+        )
+    else:
+        lines.append("- _none_")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -464,6 +720,10 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_import_submitted(registry, config, args, log)
             if args.command == "similar":
                 return cmd_similar(registry, config, args, log)
+            if args.command == "explain":
+                return cmd_explain(registry, config, args, log)
+            if args.command == "why":
+                return cmd_why(registry, config, args, log)
             if args.command == "families":
                 return cmd_families(registry, args, log)
             if args.command == "context":
