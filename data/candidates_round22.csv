@@ -1,0 +1,12 @@
+name,expression,decay,truncation,neutralization,nan_handling
+r22_p_vrp30,"v = implied_volatility_mean_30 / historical_volatility_30; group_zscore(winsorize(-ts_mean(v, 20), std=3.0), industry)",16,0.02,NONE,ON
+r22_p_hvterm,"v = historical_volatility_10 / historical_volatility_120; group_zscore(winsorize(-ts_mean(v, 20), std=3.0), industry)",16,0.02,NONE,ON
+r22_p_park,"v = parkinson_volatility_30 / historical_volatility_30; group_zscore(winsorize(-ts_mean(v, 20), std=3.0), industry)",16,0.02,NONE,ON
+r22_p_hv30,"v = historical_volatility_30; group_zscore(winsorize(-ts_mean(v, 20), std=3.0), industry)",16,0.02,NONE,ON
+r22_p_systerm,"v = systematic_risk_last_30_days / systematic_risk_last_360_days; group_zscore(winsorize(-ts_mean(v, 20), std=3.0), industry)",16,0.02,NONE,ON
+r22_p_idioratio,"v = unsystematic_risk_last_30_days / unsystematic_risk_last_360_days; group_zscore(winsorize(-ts_mean(v, 20), std=3.0), industry)",16,0.02,NONE,ON
+r22_p_beta,"bt = beta_last_30_days_spy; group_zscore(winsorize(-ts_mean(bt, 20), std=3.0), industry)",16,0.02,NONE,ON
+r22_p_sent,"s = scl12_sentiment; group_zscore(winsorize(-ts_mean(s, 20), std=3.0), industry)",16,0.02,NONE,ON
+r22_p_buzz,"b = ts_mean(scl12_buzz, 20) / ts_mean(scl12_buzz, 120); group_zscore(winsorize(-b, std=3.0), industry)",16,0.02,NONE,ON
+r22_p_partner,"p = ts_mean(rel_ret_part, 10); group_zscore(winsorize(p, std=3.0), industry)",16,0.02,NONE,ON
+r22_p_skewspread,"k = implied_volatility_mean_skew_360 - implied_volatility_mean_skew_30; group_zscore(winsorize(ts_mean(k, 20), std=3.0), industry)",16,0.02,NONE,ON

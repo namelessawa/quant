@@ -1,0 +1,10 @@
+name,expression,decay,truncation,neutralization
+rev_smooth20,"-rank(ts_mean(ts_delta(close, 5), 20))",10,0.02,SUBINDUSTRY
+rev_smooth40,"-rank(ts_mean(ts_delta(close, 5), 40))",12,0.02,SUBINDUSTRY
+tsrank20_d15,"-ts_rank(close, 20)",15,0.02,SUBINDUSTRY
+tsrank60_d10,"-ts_rank(close, 60)",10,0.02,SUBINDUSTRY
+rev_ma_diff,"-rank(ts_delta(ts_mean(close, 10), 20))",12,0.02,SUBINDUSTRY
+mom60,"-rank(ts_mean(returns, 60))",10,0.02,SUBINDUSTRY
+fv_assets_l3,"-ts_rank(fn_assets_fair_val_l3_a, 126)",8,0.02,SUBINDUSTRY
+fv_liab_l3,"-ts_rank(fn_liab_fair_val_l3_a, 126)",8,0.02,SUBINDUSTRY
+fv_liab_total,"-ts_rank(fn_liab_fair_val_a, 126)",8,0.02,SUBINDUSTRY

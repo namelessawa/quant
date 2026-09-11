@@ -1,0 +1,13 @@
+name,expression,decay,truncation,neutralization,nan_handling
+r26_ebitda_sub,"ey = ts_backfill(anl4_ebitda_value, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_fcf_sub,"ey = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_fcf_mean, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_cfo_sub,"ey = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_cfo_mean, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_bvps_sub,"ey = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_bvps_mean, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_grossincome_sub,"ey = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_grossincome_mean, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_ebit_industry,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), industry)",12,0.01,NONE,ON
+r26_ebit_look60,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 60), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_ebit_look180,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 180), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_ebit_ratio,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(winsorize(ts_mean(ey / ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_ebitda_fcf_sub,"ey = ts_backfill(anl4_ebitda_value, 40) / cap; f = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_fcf_mean, 40) / cap; s = ey + f; group_zscore(winsorize(ts_mean(s - ts_mean(s, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_cfo_netdebt_sub,"c = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_cfo_mean, 40) / cap; d = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_netdebt_mean, 40) / cap; s = c - d; group_zscore(winsorize(ts_mean(s - ts_mean(s, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r26_ebit_eps_sub,"ey = ts_backfill(anl4_ebit_value, 40) / cap; e = ts_backfill(est_eps, 40) / cap; s = ey + e; group_zscore(winsorize(ts_mean(s - ts_mean(s, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON

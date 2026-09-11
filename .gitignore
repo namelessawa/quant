@@ -1,0 +1,29 @@
+# ---- secrets: never commit these ----
+.env
+.env.*
+!.env.example
+credentials.json
+credentials.local.json
+!credentials.example.json
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE / editor
+.trae/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# local artifacts
+data/*.db
+data/*.sqlite3
+data/results.csv
+data/passed.csv
+data/failed.csv
+logs/*.log
+logs/*.out

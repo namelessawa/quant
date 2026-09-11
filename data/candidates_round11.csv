@@ -1,0 +1,10 @@
+name,expression,decay,truncation,neutralization,nan_handling
+r11_trunc08,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.08,NONE,ON
+r11_nowinsor,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(ts_mean(ey - ts_mean(ey, 120), 20), subindustry)",12,0.01,NONE,ON
+r11_decay4,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",4,0.01,NONE,ON
+r11_netprofit,"ey = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_netprofit_mean, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r11_netprofit_t08,"ey = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_netprofit_mean, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.08,NONE,ON
+r11_grouprank,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_rank(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r11_neutsub,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 120), 20), std=3.0), subindustry)",12,0.01,SUBINDUSTRY,ON
+r11_combo,"ey = ts_backfill(anl4_ebit_value, 40) / cap; np = ts_backfill(anl4_fs_detail_estimates_advanced_af_nd_netprofit_mean, 40) / cap; group_zscore(winsorize(ts_mean(ey + np - ts_mean(ey + np, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r11_win10,"ey = ts_backfill(anl4_ebit_value, 40) / cap; group_zscore(winsorize(ts_mean(ey - ts_mean(ey, 60), 10), std=3.0), subindustry)",12,0.01,NONE,ON

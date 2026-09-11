@@ -1,0 +1,10 @@
+name,expression
+fn_def_tax_neg,"-ts_rank(fn_def_tax_assets_liab_net_a, 126)"
+fn_def_tax_pos,"ts_rank(fn_def_tax_assets_liab_net_a, 126)"
+fn_aoci_neg,"-ts_rank(fn_accum_oth_income_loss_net_of_tax_a, 126)"
+fn_aoci_pos,"ts_rank(fn_accum_oth_income_loss_net_of_tax_a, 126)"
+fn_opt_grants_neg,"-ts_rank(fn_comp_options_grants_a, 126)"
+fn_opt_grants_pos,"ts_rank(fn_comp_options_grants_a, 126)"
+fn_tax_paid_neg,"-ts_rank(fn_income_taxes_paid_a, 126)"
+fn_mne_neg,"-ts_rank(fn_mne_a, 126)"
+fn_lease_neg,"-ts_rank(fn_op_lease_min_pay_due_in_4y_a, 126)"

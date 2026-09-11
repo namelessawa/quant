@@ -1,0 +1,11 @@
+name,expression,decay,truncation,neutralization,nan_handling
+r15_comp_ret5,"c = ts_mean(rel_ret_comp, 5); group_zscore(winsorize(c, std=3.0), industry)",16,0.02,NONE,ON
+r15_comp_ret5_neg,"c = ts_mean(rel_ret_comp, 5); group_zscore(winsorize(-c, std=3.0), industry)",16,0.02,NONE,ON
+r15_part_ret5,"p = ts_mean(rel_ret_part, 5); group_zscore(winsorize(p, std=3.0), industry)",16,0.02,NONE,ON
+r15_custsig,"s = ts_mean(pv13_custretsig_retsig, 5); group_zscore(winsorize(s, std=3.0), industry)",16,0.02,NONE,ON
+r15_numall_neg,"group_zscore(winsorize(-ts_rank(rel_num_all, 60), std=3.0), industry)",16,0.02,NONE,ON
+r15_pagerank,"group_zscore(winsorize(pv13_com_page_rank, std=3.0), industry)",16,0.02,NONE,ON
+r15_fwd360,"f = forward_price_360 / close; group_zscore(winsorize(ts_mean(f, 20), std=3.0), industry)",8,0.02,NONE,ON
+r15_skew_pos,"group_zscore(winsorize(ts_mean(implied_volatility_mean_skew_30, 20), std=3.0), industry)",16,0.02,NONE,ON
+r15_volterm_slow,"t = implied_volatility_mean_30 / implied_volatility_mean_360; group_zscore(winsorize(-ts_mean(t, 20), std=3.0), industry)",16,0.02,NONE,ON
+r15_assetgrowth,"a = ts_backfill(assets, 60); g = ts_delta(a, 250) / a; group_zscore(winsorize(-g, std=3.0), industry)",8,0.02,NONE,ON

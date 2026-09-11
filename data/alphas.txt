@@ -1,0 +1,9 @@
+# One expression per line. Blank lines and full-line # comments are ignored.
+# Inline comments are NOT stripped, so an expression always stays exactly as written.
+rank(ts_delta(close, 5))
+rank(ts_mean(volume, 20))
+-rank(ts_std_dev(returns, 20))
+
+# The next line differs from alpha_004 in alphas.csv only by whitespace, so it
+# normalizes to the same hash and is skipped as a duplicate.
+rank(ts_delta(close,   10))

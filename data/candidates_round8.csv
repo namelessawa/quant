@@ -1,0 +1,10 @@
+name,expression,decay,truncation,neutralization
+ebit_yield,"rank(anl4_ebit_value / cap)",12,0.01,NONE
+ebit_yield_bf,"rank(ts_backfill(anl4_ebit_value, 40) / cap)",12,0.01,NONE
+netinc_yield_bf,"rank(ts_backfill(anl4_adjusted_netincome_ft, 40) / cap)",12,0.01,NONE
+ebitda_yield_bf,"rank(ts_backfill(anl4_ebitda_value, 40) / cap)",12,0.01,NONE
+tbv_to_price,"rank(ts_backfill(anl4_tbve_ft, 40) / close)",12,0.01,NONE
+eps_yield,"rank(ts_backfill(est_eps, 40) / close)",12,0.01,NONE
+ebit_yield_sub,"rank(anl4_ebit_value / cap)",8,0.02,SUBINDUSTRY
+ebit_yield_tsr,"ts_rank(ts_backfill(anl4_ebit_value, 40) / cap, 126)",8,0.02,SUBINDUSTRY
+netinc_yield_sub,"rank(ts_backfill(anl4_adjusted_netincome_ft, 40) / cap)",8,0.02,SUBINDUSTRY

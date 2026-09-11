@@ -1,0 +1,11 @@
+name,expression,decay,truncation,neutralization,nan_handling
+r14_lowvol30,"group_zscore(winsorize(-implied_volatility_mean_30, std=3.0), industry)",8,0.02,NONE,ON
+r14_vrp30,"v = implied_volatility_mean_30 - historical_volatility_30; group_zscore(winsorize(-v, std=3.0), industry)",8,0.02,NONE,ON
+r14_vrp30_dev,"v = implied_volatility_mean_30 - historical_volatility_30; group_zscore(winsorize(ts_mean(v - ts_mean(v, 120), 20), std=3.0), industry)",8,0.02,NONE,ON
+r14_volterm,"t = implied_volatility_mean_10 / implied_volatility_mean_90; group_zscore(winsorize(-t, std=3.0), industry)",8,0.02,NONE,ON
+r14_ivskew30,"group_zscore(winsorize(-implied_volatility_mean_skew_30, std=3.0), industry)",8,0.02,NONE,ON
+r14_fwd90,"f = forward_price_90 / close; group_zscore(winsorize(ts_mean(f - ts_mean(f, 120), 20), std=3.0), industry)",8,0.02,NONE,ON
+r14_pcr30_dev,"p = pcr_oi_30; group_zscore(winsorize(ts_mean(p - ts_mean(p, 120), 20), std=3.0), industry)",8,0.02,NONE,ON
+r14_idiorisk90,"group_zscore(winsorize(-unsystematic_risk_last_90_days, std=3.0), industry)",8,0.02,NONE,ON
+r14_sent_contrarian,"group_zscore(winsorize(-ts_mean(scl12_sentiment, 5), std=3.0), industry)",4,0.02,NONE,ON
+r14_buzz_dev,"b = scl12_buzz; group_zscore(winsorize(ts_mean(b - ts_mean(b, 20), 5), std=3.0), industry)",4,0.02,NONE,ON

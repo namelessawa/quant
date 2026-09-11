@@ -1,0 +1,4 @@
+name,expression,decay,truncation,neutralization,nan_handling
+r24b_p_52wrank,"w = ts_rank(close, 250); group_zscore(winsorize(w, std=3.0), industry)",16,0.02,NONE,ON
+r24b_term_52wrank,"t = implied_volatility_mean_10 / implied_volatility_mean_60; w = ts_rank(close, 250); a = group_zscore(winsorize(-ts_mean(t, 10), std=3.0), industry); u = group_zscore(winsorize(w, std=3.0), industry); group_zscore(winsorize(a + a + u, std=3.0), industry)",16,0.02,NONE,ON
+r24b_term_rev_52wrank,"t = implied_volatility_mean_10 / implied_volatility_mean_60; r5 = ts_mean(returns, 5); w = ts_rank(close, 250); a = group_zscore(winsorize(-ts_mean(t, 10), std=3.0), industry); p = group_zscore(winsorize(-r5, std=3.0), industry); u = group_zscore(winsorize(w, std=3.0), industry); group_zscore(winsorize(a + a + p + u, std=3.0), industry)",16,0.02,NONE,ON

@@ -1,0 +1,10 @@
+name,expression,decay,truncation,neutralization,nan_handling
+r12_pcr90_mom,"x = ts_backfill(pcr_oi_90, 40); group_zscore(winsorize(ts_mean(x - ts_mean(x, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r12_pcr270_lvl,"x = ts_backfill(pcr_oi_270, 40); group_zscore(winsorize(x, std=3.0), subindustry)",12,0.01,NONE,ON
+r12_ssc_lvl,"x = ts_backfill(nws18_ssc, 40); group_zscore(winsorize(x, std=3.0), subindustry)",12,0.01,NONE,ON
+r12_qep_mom,"x = ts_backfill(nws18_qep, 40); group_zscore(winsorize(ts_mean(x - ts_mean(x, 120), 20), std=3.0), subindustry)",12,0.01,NONE,ON
+r12_sclsent_lvl,"x = ts_backfill(scl12_sentiment, 40); group_zscore(winsorize(x, std=3.0), subindustry)",12,0.01,NONE,ON
+r12_buzz_neg,"x = -ts_backfill(scl12_buzz, 40); group_zscore(winsorize(x, std=3.0), subindustry)",12,0.01,NONE,ON
+r12_hv20_neg,"x = -ts_backfill(historical_volatility_20, 40); group_zscore(winsorize(x, std=3.0), subindustry)",12,0.01,NONE,ON
+r12_idiovol_neg,"x = -ts_backfill(unsystematic_risk_last_90_days, 40); group_zscore(winsorize(x, std=3.0), subindustry)",12,0.01,NONE,ON
+r12_roa,"x = ts_backfill(operating_income, 40) / ts_backfill(assets, 40); group_zscore(winsorize(x, std=3.0), subindustry)",12,0.01,NONE,ON

@@ -1,0 +1,10 @@
+name,expression,decay,truncation,neutralization
+hump_tsrank5_05,"hump(-ts_rank(close, 5), hump=0.05)",0,0.02,INDUSTRY
+hump_tsrank5_10,"hump(-ts_rank(close, 5), hump=0.1)",0,0.02,INDUSTRY
+hump_tsrank5_20,"hump(-ts_rank(close, 5), hump=0.2)",0,0.02,INDUSTRY
+hump_tsrank5_30,"hump(-ts_rank(close, 5), hump=0.3)",0,0.02,INDUSTRY
+hump_rev5_10,"hump(-rank(ts_delta(close, 5)), hump=0.1)",0,0.02,SUBINDUSTRY
+hump_rev5_20,"hump(-rank(ts_delta(close, 5)), hump=0.2)",0,0.02,SUBINDUSTRY
+hump_tsrank5_10_sub,"hump(-ts_rank(close, 5), hump=0.1)",0,0.02,SUBINDUSTRY
+hump_tsrank10_10,"hump(-ts_rank(close, 10), hump=0.1)",0,0.02,INDUSTRY
+hump_volnorm_10,"hump(-rank(ts_delta(close, 5) / ts_std_dev(close, 20)), hump=0.1)",0,0.02,SUBINDUSTRY

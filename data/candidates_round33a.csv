@@ -1,0 +1,19 @@
+name,expression,delay,decay,truncation,neutralization,pasteurization,nanHandling
+r33a_news_qep_p,"group_zscore(winsorize(ts_mean(nws18_qep, 5), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_news_qep_n,"group_zscore(winsorize(-ts_mean(nws18_qep, 5), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_news_ssc_p,"group_zscore(winsorize(ts_mean(nws18_ssc, 5), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_news_ssc_n,"group_zscore(winsorize(-ts_mean(nws18_ssc, 5), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_m16_composite,"group_zscore(winsorize(ts_mean(composite_factor_score_derivative, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_m16_static,"group_zscore(winsorize(ts_mean(multi_factor_static_score_derivative, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_m16_accel,"group_zscore(winsorize(ts_mean(multi_factor_acceleration_score_derivative, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_m16_revision,"group_zscore(winsorize(ts_mean(analyst_revision_rank_derivative, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_m16_growth,"group_zscore(winsorize(ts_mean(growth_potential_rank_derivative, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_m16_relval,"group_zscore(winsorize(ts_mean(relative_valuation_rank_derivative, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_m16_cf,"group_zscore(winsorize(ts_mean(cashflow_efficiency_rank_derivative, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_m16_earncer,"group_zscore(winsorize(ts_mean(earnings_certainty_rank_derivative, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_pv13_relretall,"group_zscore(winsorize(ts_mean(rel_ret_all, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_pv13_relretpart,"group_zscore(winsorize(-ts_mean(rel_ret_part, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_pv13_relnum,"group_zscore(winsorize(ts_mean(rel_num_all, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_pv13_pagerank,"group_zscore(winsorize(ts_mean(pv13_com_page_rank, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_pv13_retsig,"group_zscore(winsorize(ts_mean(pv13_custretsig_retsig, 10), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+r33a_fnd6_opinc,"group_zscore(winsorize(ts_mean(operating_income / cap, 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON

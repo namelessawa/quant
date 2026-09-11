@@ -1,0 +1,117 @@
+# WorldQuant BRAIN backtest configuration.
+#
+# Credentials are NEVER stored here. Set WQBRAIN_USERNAME / WQBRAIN_PASSWORD in
+# the environment or in a .env file (copy .env.example).
+#
+# Every value below is the built-in default; delete a section to accept it.
+
+base_url: https://api.worldquantbrain.com
+
+# Backtest settings sent in the POST /simulations body.
+# Field names are what the BRAIN API actually expects (camelCase). snake_case
+# aliases such as `unit_handling` / `nan_handling` / `instrument_type` are also
+# accepted and translated automatically.
+settings:
+  instrumentType: EQUITY
+  region: USA
+  universe: TOP3000
+  delay: 1
+  decay: 0
+  neutralization: INDUSTRY
+  truncation: 0.08
+  pasteurization: "ON"     # quoted: a bare ON/OFF is a YAML 1.1 boolean
+  unitHandling: "VERIFY"
+  nanHandling: "OFF"       # quoted for the same reason
+  language: "FASTEXPR"
+  visualization: false     # this one really is a boolean
+  testPeriod: "P1Y"        # mandatory: hold out the last year as a test period,
+                           # splitting IS into train/test
+
+# Automatic pass/fail thresholds. Set a value to null to disable that rule.
+# turnover / returns / drawdown are DECIMAL FRACTIONS: 0.70 means 70%.
+filters:
+  min_sharpe: 1.25
+  min_fitness: 1.0
+  max_turnover: 0.70
+  min_returns: null
+  max_drawdown: null
+  min_margin: null
+
+  # Yearly stability. These rules are skipped for an alpha with no yearly data,
+  # unless require_yearly_data is true.
+  min_positive_year_ratio: 0.6
+  max_negative_sharpe_years: 1
+  min_worst_year_sharpe: null
+  max_yearly_sharpe_std: null
+  require_yearly_data: false
+
+runner:
+  poll_interval: 10      # seconds between status polls when the server sends no Retry-After
+  poll_jitter: 3         # random 0..jitter added to each poll, so workers do not sync up
+  max_wait: 1800         # seconds to wait for one simulation before marking it TIMEOUT
+  concurrency: 2         # clamped to 1..3; higher values get rejected as too aggressive
+  min_request_interval: 1.0   # global floor between ANY two HTTP requests
+
+retry:
+  max_retries: 5         # attempts after the first, for 429 / 5xx / network errors
+  backoff_base: 2.0      # delay = min(cap, base ** attempt)
+  backoff_cap: 60.0      # ceiling for our own exponential backoff
+  retry_after_cap: 120.0 # ceiling for honouring a server-sent Retry-After header
+  timeout: 30.0          # per-request socket timeout, always set
+  jitter: 0.3            # fraction of the delay added as random jitter
+
+storage:
+  data_dir: data
+  db_path: data/worldquant.db
+  log_file: logs/worldquant.log
+  log_level: INFO
+
+yearly_stats:
+  # Verified against the live API: returns a JSON recordset (schema + positional
+  # records), not CSV. Columns are mapped by schema name, so BRAIN reordering or
+  # adding columns cannot shift values. A failure still degrades gracefully:
+  # yearly stats come back empty and the yearly rules are skipped.
+  enabled: true
+  path: /alphas/{alpha_id}/recordsets/yearly-stats
+
+# Factor Registry / Alpha Memory System.
+# Independent SQLite database (data/factor_registry.db); it never touches
+# worldquant.db. All 10 lifecycle states, three-level fingerprints (exact /
+# template / structure), novelty 0..100 and the research correlation gate are
+# recorded here. Disable with `enabled: false` to restore historical behavior.
+factor_registry:
+  enabled: true
+  db_path: factor_registry.db   # resolved against storage.data_dir
+
+  # Pre-simulation duplicate / novelty gate.
+  pre_simulation:
+    reject_exact_duplicate: true
+    min_novelty: 15.0           # skip candidates below this only if the template is saturated
+    max_template_trials: 30     # a template tried >= N times is saturated
+    reject_if_saturated_and_low_novelty: true
+
+  # Research correlation gate. Official BRAIN SELF_CORRELATION verdicts are
+  # always stored as delivered; this only controls the local 0.70 cutoff.
+  correlation:
+    enabled: true
+    threshold: 0.70
+    use_absolute_value: true    # -0.9 is as redundant as +0.9
+
+  # Novelty component weights (rescaled to sum to 1).
+  novelty:
+    structure_weight: 0.30
+    field_weight: 0.25
+    family_weight: 0.20
+    parameter_weight: 0.15
+    combination_weight: 0.10
+
+  # Connected-component clustering over stored correlations.
+  clustering:
+    enabled: true
+    corr_threshold: 0.70
+
+  # research_priority = 0.6*quality + 0.4*novelty
+  scoring:
+    quality_weight: 0.6
+    novelty_weight: 0.4
+

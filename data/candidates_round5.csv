@@ -1,0 +1,10 @@
+name,expression,decay,truncation,neutralization
+rev5_d25,"-rank(ts_delta(close, 5))",25,0.02,SUBINDUSTRY
+rev5_d40,"-rank(ts_delta(close, 5))",40,0.02,SUBINDUSTRY
+tsrank5_d30,"-ts_rank(close, 5)",30,0.02,SUBINDUSTRY
+tsrank10_d20,"-ts_rank(close, 10)",20,0.02,SUBINDUSTRY
+tsrank5_d50,"-ts_rank(close, 5)",50,0.02,SUBINDUSTRY
+combo_rev,"-rank(ts_delta(close, 5)) - rank(ts_delta(close, 10)) - rank(ts_delta(close, 20))",12,0.02,SUBINDUSTRY
+rev_plus_lowvol,"-rank(ts_delta(close, 5)) + rank(ts_std_dev(returns, 60))",12,0.02,SUBINDUSTRY
+rev_volnorm,"-rank(ts_delta(close, 5) / ts_std_dev(close, 20))",15,0.02,SUBINDUSTRY
+tsrank20_d25,"-ts_rank(close, 20)",25,0.02,SUBINDUSTRY

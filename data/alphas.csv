@@ -1,0 +1,6 @@
+name,expression
+alpha_001,"rank(ts_delta(close, 5))"
+alpha_002,"rank(ts_mean(volume, 20))"
+alpha_003,"-rank(ts_std_dev(returns, 20))"
+alpha_004,"rank(ts_delta(close, 10))"
+alpha_005,"group_neutralize(rank(ts_mean(returns, 5)), 'industry')"
