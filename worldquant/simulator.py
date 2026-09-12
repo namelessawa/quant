@@ -459,6 +459,7 @@ class SimulationRunner:
         # alone, and SELF_CORRELATION is only ever resolved here.
         submission_checks: dict[str, Any] = {}
         self_correlation: float | None = None
+        self_correlated_with: list[dict[str, Any]] | None = None
         checker = getattr(self.client, "check_submission", None)
         if callable(checker):
             try:
@@ -472,6 +473,9 @@ class SimulationRunner:
                 if isinstance(checked, dict) and checked.get("total"):
                     submission_checks = checked.get("checks") or {}
                     self_correlation = checked.get("self_correlation")
+                    neighbors = checked.get("self_correlated_with")
+                    if isinstance(neighbors, list) and neighbors:
+                        self_correlated_with = neighbors
 
         metrics = alpha_data.get("metrics") or {}
         result = AlphaResult(
@@ -503,6 +507,7 @@ class SimulationRunner:
             test_stats=alpha_data.get("test"),
             submission_checks=submission_checks or None,
             self_correlation=self_correlation,
+            self_correlated_with=self_correlated_with,
             created_at=utcnow_iso(),
             completed_at=utcnow_iso(),
         )

@@ -79,6 +79,14 @@ from .gates import (
 )
 from .importer import import_submitted_factors, migrate_existing_results
 from .migrations import SCHEMA_VERSION
+from .pipeline import (
+    AcceptanceDecision,
+    GateBatchResult,
+    describe_corr_verdicts,
+    evaluate_acceptance,
+    gate_specs,
+    record_results,
+)
 from .scoring import quality_score, research_priority
 from .store import (
     CORR_TYPE_PRODUCTION,
@@ -156,4 +164,11 @@ __all__ = [
     "record_completed",
     "mark_submission_outcome",
     "load_field_datasets",
+    # unified research pipeline
+    "gate_specs",
+    "record_results",
+    "evaluate_acceptance",
+    "AcceptanceDecision",
+    "GateBatchResult",
+    "describe_corr_verdicts",
 ]

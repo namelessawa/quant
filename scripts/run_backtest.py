@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import replace
+from contextlib import nullcontext
 from pathlib import Path
 
 # Allow running from any working directory.
@@ -55,7 +55,12 @@ from worldquant import (  # noqa: E402
     write_ledger_from_results,
 )
 from worldquant.api import AlphaGrade, SimulationStatus  # noqa: E402
-from worldquant.config import ConfigError  # noqa: E402
+from worldquant.config import ConfigError, apply_storage_overrides  # noqa: E402
+from worldquant.registry import (  # noqa: E402
+    gate_specs,
+    open_registry,
+    record_results,
+)
 
 EXIT_OK = 0
 EXIT_RUNTIME_FAILURE = 1
@@ -102,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     behaviour.add_argument(
         "--no-yearly", action="store_true", help="skip the yearly-stats enrichment call"
+    )
+    behaviour.add_argument(
+        "--no-registry", action="store_true",
+        help="disable the Factor Registry research-memory gate and recording "
+             "(enabled by default); --force also bypasses the registry gate",
     )
 
     mode = parser.add_argument_group("modes")
@@ -326,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(args.config, overrides=overrides, credentials_path=args.credentials)
 
         storage_overrides = {
-            key: Path(value)
+            key: value
             for key, value in (
                 ("db_path", args.db),
                 ("log_file", args.log_file),
@@ -335,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
             if value
         }
         if storage_overrides:
-            config = replace(config, storage=replace(config.storage, **storage_overrides))
+            config = apply_storage_overrides(config, **storage_overrides)
 
         validate_filter_config(config.filters)
         setup_logging(config.storage.log_file, args.log_level or config.storage.log_level)
@@ -377,13 +387,22 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = EXIT_OK
     results: list[AlphaResult] = []
 
+    # Research memory gate. Enabled by default; --no-registry restores the
+    # pre-Registry execution path exactly. Opening does not require BRAIN auth.
+    registry_cm = (
+        nullcontext()
+        if args.no_registry
+        else (open_registry(config, log=log) or nullcontext())
+    )
+
     with WorldQuantClient(
         credentials,
         base_url=config.base_url,
         retry=config.retry,
         min_request_interval=config.runner.min_request_interval,
         yearly_stats_path=config.yearly_stats_path,
-    ) as client, ResultStore(config.storage.db_path) as store:
+    ) as client, ResultStore(config.storage.db_path) as store, \
+            registry_cm as registry:
         runner = SimulationRunner(
             client, store, config, experiment_log=build_ledger(config, client, logger=log)
         )
@@ -399,12 +418,42 @@ def main(argv: list[str] | None = None) -> int:
                 # same run, reporting one deterministic error twice.
                 results.extend(runner.resume_incomplete())
                 if specs:
-                    results.extend(runner.run_batch(specs, force=args.force, limit=args.limit))
+                    # Registry gate FIRST (research identity for every attempt,
+                    # including blocked ones), ResultStore execution dedup
+                    # second (inside the runner). --force bypasses both; the
+                    # registry never writes fake ResultStore rows for blocks.
+                    gate_result = gate_specs(
+                        registry, specs, force=args.force, log=log
+                    )
+                    if registry is not None and gate_result.blocked:
+                        log.info(
+                            "Registry gate blocked %d/%d candidate(s) — no "
+                            "simulation submitted for those; %d remain",
+                            gate_result.blocked, len(specs), len(gate_result.kept),
+                        )
+                    if gate_result.kept:
+                        results.extend(
+                            runner.run_batch(
+                                gate_result.kept,
+                                force=args.force,
+                                limit=args.limit,
+                            )
+                        )
+                    elif registry is not None:
+                        log.info(
+                            "Every candidate was blocked by the Registry gate; "
+                            "nothing to simulate."
+                        )
 
             # resume_incomplete and run_batch can both report the same alpha:
             # resume finishes it, then the batch skips it as already complete.
             # Collapse so the summary counts alphas, not code paths.
             results = latest_per_alpha(results)
+
+            # Fold every real execution (including resumed ones) into research
+            # memory: metrics, lifecycle status and the research corr verdict.
+            # Never raises into the run.
+            record_results(registry, results)
 
             summarize(results, log)
             export_and_report(

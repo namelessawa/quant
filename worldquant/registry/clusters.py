@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .store import CORR_TYPE_SELF, CORR_TYPE_SELF_MAX, FactorRegistry, FactorStatus
+from .store import CORR_TYPE_SELF, FactorRegistry, FactorStatus
 
 
 class _UnionFind:
@@ -84,19 +84,22 @@ class CorrelationCluster:
 def _edges(registry: FactorRegistry, threshold: float) -> list[tuple[int, int, float]]:
     """Undirected edges above the cutoff.
 
-    Two edge sources are merged:
-    * local links (``other_factor_id`` resolved to a registry factor);
-    * remote links (``other_brain_alpha_id`` matching another registered
-      factor's BRAIN id), which cover the imported submitted set.
+    Only *real pairwise* edges enter the graph: per-neighbor rows of
+    ``correlation_type='SELF'`` whose neighbor resolves to a registry factor
+    (directly via ``other_factor_id`` or via a BRAIN alpha id, which also
+    covers the imported submitted set). The ``SELF_MAX`` aggregate row has no
+    neighbor at all — it exists solely to feed the correlation gate — so it can
+    never create an edge or merge clusters.
     """
     rows = registry._query(
         """
         SELECT factor_id, other_factor_id, other_brain_alpha_id,
                abs_correlation, correlation
         FROM factor_correlations
-        WHERE COALESCE(abs_correlation, ABS(COALESCE(correlation, 0.0))) >= ?
+        WHERE correlation_type = ?
+          AND COALESCE(abs_correlation, ABS(COALESCE(correlation, 0.0))) >= ?
         """,
-        (threshold,),
+        (CORR_TYPE_SELF, threshold),
     )
     brain_to_id = {
         str(row["brain_alpha_id"]): int(row["id"])

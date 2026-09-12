@@ -1,6 +1,7 @@
-"""v1 -> v2 registry migration tests.
+"""v1 -> v3 registry migration tests (covering the v1 -> v2 step).
 
-A hand-built database with the *old* schema proves that upgrading:
+A hand-built database with the *old* (v1) schema proves that upgrading all the
+way to the current schema:
 
 * takes a one-time ``.v1.bak`` safety copy (never overwritten),
 * keeps every historical row, metric, correlation and brain alpha id,
@@ -10,11 +11,16 @@ A hand-built database with the *old* schema proves that upgrading:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
 import pytest
 
+from worldquant.hashing import (
+    expression_identity,
+    signal_identity,
+)
 from worldquant.registry import FactorRegistry, FactorStatus
 from worldquant.registry.config import RegistryConfig
 from worldquant.registry.store import CORR_TYPE_SELF
@@ -248,12 +254,29 @@ def test_v1_to_v2_preserves_history_and_backfills(v1_db):
         assert by_id[2]["status"] == FactorStatus.CORR_REJECTED
         assert by_id[3]["status"] == FactorStatus.SUBMITTED
         assert by_id[3]["brain_alpha_id"] == "BRA-9002"
+        # All three identity layers are populated; experiment_hash is the
+        # historical exact_hash and signal_hash is the v3 scoped identity.
         for row in rows:
             assert row["signal_hash"]
-            assert row["experiment_hash"] == "hash-a" if row["id"] == 1 else True
             assert row["family_template_hash"]
         # experiment_hash is the historical exact_hash (pure SQL backfill).
         assert by_id[2]["experiment_hash"] == "hash-b"
+
+        identity_rows = registry._query(
+            "SELECT id, canonical_expression, settings_json, exact_hash, "
+            "expression_hash, signal_hash, experiment_hash FROM factors ORDER BY id"
+        )
+        for row in identity_rows:
+            settings = json.loads(row["settings_json"] or "{}")
+            assert row["expression_hash"] == expression_identity(
+                row["canonical_expression"]
+            )
+            assert row["signal_hash"] == signal_identity(
+                row["canonical_expression"], settings
+            )
+            # Legacy exact_hash values (synthetic in this hand-built fixture,
+            # real SHA256 in production) are carried over verbatim.
+            assert row["experiment_hash"] == row["exact_hash"]
 
         metrics = registry.get_metrics(2)
         assert metrics["sharpe"] == pytest.approx(1.71)
@@ -291,13 +314,13 @@ def test_migration_is_idempotent_and_never_overwrites_backup(v1_db):
         meta = registry._query(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         )
-        assert meta and meta[0]["value"] == "2"
+        assert meta and meta[0]["value"] == "3"
 
     assert backup.exists()
     assert backup.stat().st_size == first_size
     raw = sqlite3.connect(str(v1_db))
     try:
-        assert raw.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 3
         assert raw.execute("SELECT COUNT(*) FROM factors").fetchone()[0] == 3
     finally:
         raw.close()

@@ -150,6 +150,10 @@ class AlphaResult:
     submission_checks: dict[str, Any] | None = None
     #: Worst correlation against the account's existing alphas, from that check.
     self_correlation: float | None = None
+    #: Per-neighbor rows behind ``self_correlation`` (each with at least
+    #: ``alpha_id`` and ``correlation``), when the check payload exposes them.
+    #: Feeds the registry's pairwise correlation graph; never re-requested.
+    self_correlated_with: list[dict[str, Any]] | None = None
 
     created_at: str = ""
     completed_at: str | None = None

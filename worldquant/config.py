@@ -457,6 +457,47 @@ def load_config(
     return config
 
 
+def apply_storage_overrides(
+    config: AppConfig,
+    *,
+    db_path: Path | str | None = None,
+    log_file: Path | str | None = None,
+    data_dir: Path | str | None = None,
+) -> AppConfig:
+    """Apply CLI storage overrides and keep dependent paths consistent.
+
+    The registry's ``db_path`` is resolved against ``storage.data_dir`` at
+    config-load time; a later ``--data-dir`` override must move it too,
+    otherwise a test/tmp run would silently open the real
+    ``data/factor_registry.db``. A registry path that lives outside the old
+    data directory (an explicitly configured absolute location) is preserved.
+    """
+    overrides = {
+        key: Path(value)
+        for key, value in (("db_path", db_path), ("log_file", log_file),
+                           ("data_dir", data_dir))
+        if value
+    }
+    if not overrides:
+        return config
+
+    old_data_dir = config.storage.data_dir
+    config = replace(config, storage=replace(config.storage, **overrides))
+
+    if data_dir is not None and config.registry.enabled:
+        try:
+            relative = Path(config.registry.db_path).relative_to(old_data_dir)
+        except ValueError:
+            return config
+        config = replace(
+            config,
+            registry=replace(
+                config.registry, db_path=Path(data_dir) / relative
+            ),
+        )
+    return config
+
+
 _RUNNER_KEYS = frozenset(
     {"poll_interval", "poll_jitter", "max_wait", "concurrency", "min_request_interval"}
 )

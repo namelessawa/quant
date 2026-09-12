@@ -18,12 +18,14 @@ backtest run, so callers can use them unconditionally inside ``try`` blocks.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from ..logging_utils import get_logger
 from .gates import (
     ACTION_REJECT_EXACT,
+    ACTION_SIMULATE,
     ACTION_SKIP_LOW_NOVELTY,
     ACTION_SKIP_SIGNAL_DUPLICATE,
     PreSimulationGateResult,
@@ -87,18 +89,70 @@ def gate_candidate(
     changed_parameters: dict[str, Any] | None = None,
     parent_experiment_id: int | None = None,
 ) -> tuple[int | None, PreSimulationGateResult | None]:
-    """Register a candidate and run the pre-simulation gate.
+    """Evaluate the pre-simulation gate, then record the candidate.
 
-    Returns ``(factor_id, decision)``. A rejected/skipped candidate has its
-    lifecycle status recorded already (``DUPLICATE`` — the exact row for an
-    exact match, or a novelty/signal-saturation skip tagged in the reason).
-    Returns ``(None, None)`` when bookkeeping itself fails, in which case the
-    caller should not block the simulation.
+    Gate evaluation runs *before* registration on purpose: registering the
+    candidate first would make a brand-new experiment match itself as its own
+    exact duplicate and block every first-time simulation. Returns
+    ``(factor_id, decision)``; ``(None, None)`` when bookkeeping itself fails,
+    in which case the caller should not block the simulation.
+
+    Blocked candidates are still recorded in research memory:
+
+    * ``REJECT_EXACT_DUPLICATE`` points at the *prior* factor row, which is the
+      memory. A prior row that was already researched is never demoted to
+      ``DUPLICATE`` — only a never-run ``GENERATED`` row is tagged.
+    * signal-saturation / low-novelty skips are distinct experiments, so a new
+      row is inserted and tagged ``DUPLICATE`` with the reason preserved.
 
     Pass ``source='ablation'`` (or ``ablation_group_id``) for deliberate
     parameter sweeps: same-signal skips are then suppressed by design.
     """
     try:
+        decision = pre_simulation_gate(
+            registry, expression, settings, source=source, force=force
+        )
+
+        if decision.passed:
+            candidate = registry.register_candidate(
+                expression,
+                settings,
+                source=source or "generator",
+                ablation_group_id=ablation_group_id,
+                changed_parameters=changed_parameters,
+                parent_experiment_id=parent_experiment_id,
+            )
+            factor_id = candidate.factor_id
+            if decision.novelty is not None:
+                registry.set_novelty_score(factor_id, float(decision.novelty.score))
+            return factor_id, decision
+
+        if decision.action == ACTION_REJECT_EXACT:
+            factor_id = decision.duplicate.exact_factor_id
+            if factor_id is not None:
+                prior = registry.get_factor(factor_id)
+                if prior is not None and prior["status"] == FactorStatus.GENERATED:
+                    # Registered in an earlier run but never simulated
+                    # (interrupted before run_batch): it is not researched
+                    # memory yet, so recover it and let this attempt run.
+                    candidate = registry.register_candidate(
+                        expression,
+                        settings,
+                        source=source or "generator",
+                        ablation_group_id=ablation_group_id,
+                        changed_parameters=changed_parameters,
+                        parent_experiment_id=parent_experiment_id,
+                    )
+                    return candidate.factor_id, replace(
+                        decision, passed=True, action=ACTION_SIMULATE
+                    )
+            # Never destroy research history: a factor that was already
+            # simulated / passed / submitted keeps its lifecycle status even
+            # though the new attempt is blocked. The prior row is the memory.
+            return factor_id, decision
+
+        # Distinct experiment blocked by sweep capacity or low novelty:
+        # record the attempt as its own DUPLICATE row.
         candidate = registry.register_candidate(
             expression,
             settings,
@@ -108,27 +162,18 @@ def gate_candidate(
             parent_experiment_id=parent_experiment_id,
         )
         factor_id = candidate.factor_id
-        decision = pre_simulation_gate(
-            registry, expression, settings, source=source, force=force
-        )
-        if not decision.passed:
-            if decision.action == ACTION_REJECT_EXACT:
-                registry.mark_duplicate(
-                    factor_id, f"exact duplicate: {decision.reason}"
-                )
-            elif decision.action == ACTION_SKIP_SIGNAL_DUPLICATE:
-                # Same canonical expression already explored with different
-                # settings; the message steers toward new data/legs, not sweeps.
-                registry.mark_duplicate(
-                    factor_id, f"same signal skip: {decision.reason}"
-                )
-            elif decision.action == ACTION_SKIP_LOW_NOVELTY:
-                # No dedicated status for this; record it as a pre-simulation
-                # duplicate-class decision with the novelty reason preserved.
-                registry.mark_duplicate(
-                    factor_id, f"low novelty skip: {decision.reason}"
-                )
-        # Stash the score for ranking/reporting.
+        if decision.action == ACTION_SKIP_SIGNAL_DUPLICATE:
+            # Same canonical expression already explored with different
+            # settings; the message steers toward new data/legs, not sweeps.
+            registry.mark_duplicate(
+                factor_id, f"same signal skip: {decision.reason}"
+            )
+        elif decision.action == ACTION_SKIP_LOW_NOVELTY:
+            # Record it as a pre-simulation duplicate-class decision with the
+            # novelty reason preserved.
+            registry.mark_duplicate(
+                factor_id, f"low novelty skip: {decision.reason}"
+            )
         if decision.novelty is not None:
             registry.set_novelty_score(factor_id, float(decision.novelty.score))
         return factor_id, decision
@@ -146,8 +191,14 @@ def record_completed(
     """Persist a finished (or failed) simulation via the registry adapter.
 
     Thin wrapper around :meth:`FactorRegistry.handle_completed`, kept as a
-    function so scripts have a single import and a stable call shape.
+    function so scripts have a single import and a stable call shape. When the
+    caller does not pass ``corr_records`` explicitly, the per-neighbor rows
+    already parsed from BRAIN's submission check
+    (``result.self_correlated_with``) are used — the check endpoint is never
+    called a second time.
     """
+    if corr_records is None:
+        corr_records = getattr(result, "self_correlated_with", None)
     return registry.handle_completed(result, corr_records=corr_records)
 
 

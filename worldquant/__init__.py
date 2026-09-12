@@ -73,13 +73,18 @@ from .registry import (
     CorrelationGate,
     FactorRegistry,
     FactorStatus,
+    AcceptanceDecision,
     build_generation_context,
+    describe_corr_verdicts,
+    evaluate_acceptance,
     gate_candidate,
+    gate_specs,
     import_submitted_factors,
     migrate_existing_results,
     open_registry,
     pre_simulation_gate,
     record_completed,
+    record_results,
 )
 from .simulator import SimulationRunner
 from .storage import ResultStore
@@ -145,6 +150,11 @@ __all__ = [
     "open_registry",
     "gate_candidate",
     "record_completed",
+    "gate_specs",
+    "record_results",
+    "evaluate_acceptance",
+    "AcceptanceDecision",
+    "describe_corr_verdicts",
     # experiment ledger
     "LEDGER_COLUMNS",
     "ExperimentLog",

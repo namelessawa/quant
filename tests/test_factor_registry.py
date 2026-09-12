@@ -721,18 +721,45 @@ class TestAdapter:
         assert registry is not None
         registry.close()
 
-    def test_gate_candidate_marks_exact_duplicate(self, tmp_path):
+    def test_gate_candidate_blocks_exact_duplicate_without_erasing_memory(self, tmp_path):
         config = replace(
             make_config(tmp_path),
             registry=RegistryConfig(enabled=True, db_path=tmp_path / "fr.db"),
         )
         with open_registry(config) as registry:
-            simulate(registry, "rank(ts_delta(close,5))", "a1")
+            prior_id = simulate(registry, "rank(ts_delta(close,5))", "a1")
+            prior_status = registry.get_factor(prior_id)["status"]
             factor_id, decision = gate_candidate(
                 registry, "rank(ts_delta(close,5))", SETTINGS
             )
             assert decision.action == "REJECT_EXACT_DUPLICATE"
-            assert registry.get_factor(factor_id)["status"] == FactorStatus.DUPLICATE
+            # The blocked attempt points at the researched prior row, whose
+            # lifecycle status is research memory and must not be erased.
+            assert factor_id == prior_id
+            assert registry.get_factor(factor_id)["status"] == prior_status
+            assert registry.get_factor(factor_id)["status"] != FactorStatus.DUPLICATE
+
+    def test_gate_candidate_passes_fresh_candidate_and_recovers_generated(self, tmp_path):
+        config = replace(
+            make_config(tmp_path),
+            registry=RegistryConfig(enabled=True, db_path=tmp_path / "fr.db"),
+        )
+        with open_registry(config) as registry:
+            # A never-seen experiment must pass the gate.
+            factor_id, decision = gate_candidate(
+                registry, "rank(ts_delta(close,5))", SETTINGS
+            )
+            assert decision.passed is True
+            assert decision.action == "SIMULATE"
+            assert registry.get_factor(factor_id)["status"] == FactorStatus.GENERATED
+            # An interrupted prior run left a GENERATED row: the retry must be
+            # allowed to simulate instead of self-blocking as an exact dup.
+            retried_id, retried = gate_candidate(
+                registry, "rank(ts_delta(close,5))", SETTINGS
+            )
+            assert retried_id == factor_id
+            assert retried.passed is True
+            assert retried.action == "SIMULATE"
 
     def test_record_completed_folds_result(self, registry):
         registry.register_candidate("rank(close)", SETTINGS)

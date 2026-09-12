@@ -125,6 +125,38 @@ def dedup_key(expression: str, settings: dict[str, Any] | None = None) -> str:
     return _sha256(normalized + _HASH_SEPARATOR + canonical)
 
 
+# --------------------------------------------------------------------------- #
+# Unified three-layer research identity
+# --------------------------------------------------------------------------- #
+# Both :class:`~worldquant.storage.ResultStore` (execution dedup) and
+# :class:`~worldquant.registry.store.FactorRegistry` (research memory) MUST use
+# these functions — never re-derive an identity hash inline, so the two stores
+# can never disagree about what counts as "the same alpha".
+#
+#   expression_identity  — mathematical expression alone
+#   signal_identity      — expression + information set (region/universe/delay)
+#   experiment_identity  — expression + every normalized simulation setting
+def expression_identity(expression: str) -> str:
+    """Identity of the mathematical expression, independent of any settings."""
+    return expression_hash(expression)
+
+
+def signal_identity(expression: str, settings: dict[str, Any] | None = None) -> str:
+    """Identity of a *research signal*.
+
+    Same expression over a different universe (TOP3000 vs TOP1000) or at a
+    different delay predicts a different instrument set with different
+    information timing — a different signal. Portfolio-construction settings
+    (decay/truncation/neutralization/...) do NOT change the signal.
+    """
+    return scope_hash(expression, settings)
+
+
+def experiment_identity(expression: str, settings: dict[str, Any] | None = None) -> str:
+    """Identity of a complete simulation experiment (expression + all settings)."""
+    return dedup_key(expression, settings)
+
+
 def auto_alpha_id(expression: str, settings: dict[str, Any] | None = None) -> str:
     """Generate a short, stable id for an alpha that has no explicit name."""
     return "alpha_" + dedup_key(expression, settings)[:10]

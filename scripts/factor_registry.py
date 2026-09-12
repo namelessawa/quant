@@ -58,8 +58,13 @@ from worldquant.registry import (  # noqa: E402
     FactorStatus,
     build_generation_context,
     get_cluster_representatives,
+    get_clusters,
 )
 from worldquant.registry.adapter import open_registry  # noqa: E402
+from worldquant.registry.refresh import (  # noqa: E402
+    backfill_correlations,
+    refresh_unknown_correlations,
+)
 
 EXIT_OK = 0
 EXIT_USAGE_ERROR = 2
@@ -122,6 +127,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser("report", help="write a Markdown registry report")
     report.add_argument("--output", "-o", help="output path (default reports/...)")
+
+    refresh = sub.add_parser(
+        "refresh-corr",
+        help="re-check SIMULATED factors with UNKNOWN corr via GET .../check "
+             "(read-only; no simulation, no submission)",
+    )
+    refresh.add_argument("--limit", type=int, default=50,
+                         help="maximum factors to refresh this run")
+    refresh.add_argument("--alpha-id", default=None,
+                         help="refresh one specific BRAIN alpha id")
+
+    backfill = sub.add_parser(
+        "backfill-corr",
+        help="pull per-neighbor SELF edges for factors that only have SELF_MAX "
+             "(read-only; no simulation)",
+    )
+    backfill.add_argument("--limit", type=int, default=100,
+                          help="maximum factors to backfill this run")
+
+    clusters = sub.add_parser(
+        "clusters",
+        help="print correlation clusters built from real pairwise edges",
+    )
+    clusters.add_argument("--min-size", type=int, default=1,
+                          help="hide clusters smaller than this")
+    clusters.add_argument("--threshold", type=float, default=None,
+                          help="edge |corr| cutoff (default: config clustering)")
 
     return parser
 
@@ -190,6 +222,69 @@ def cmd_import_submitted(registry, config, args, log) -> int:
             client, registry, max_pages=args.max_pages, log=log
         )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return EXIT_OK
+
+
+def _with_client(config, fn):
+    """Run ``fn(client)`` inside an authenticated BRAIN client session."""
+    credentials = require_credentials(config)
+    with WorldQuantClient(
+        credentials,
+        base_url=config.base_url,
+        retry=config.retry,
+        min_request_interval=config.runner.min_request_interval,
+    ) as client:
+        client.ensure_authenticated()
+        return fn(client)
+
+
+def cmd_refresh_corr(registry, config, args, log) -> int:
+    summary = _with_client(
+        config,
+        lambda client: refresh_unknown_correlations(
+            client, registry, limit=args.limit, alpha_id=args.alpha_id, log=log
+        ),
+    )
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return EXIT_OK
+
+
+def cmd_backfill_corr(registry, config, args, log) -> int:
+    summary = _with_client(
+        config,
+        lambda client: backfill_correlations(
+            client, registry, limit=args.limit, log=log
+        ),
+    )
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return EXIT_OK
+
+
+def cmd_clusters(registry, config, args, log) -> int:
+    clusters = get_clusters(
+        registry, threshold=args.threshold, min_size=args.min_size
+    )
+    if not clusters:
+        print("No correlation clusters (no pairwise edges above the cutoff).")
+        return EXIT_OK
+    header = (
+        f"{'cluster':>7} {'size':>4} {'representative':>14} "
+        f"{'submitted':>9} {'avg_corr':>8} {'max_corr':>8} "
+        f"{'saturated':>9}  theme"
+    )
+    print(header)
+    print("-" * len(header))
+    for cluster in clusters:
+        avg = f"{cluster.avg_corr:.3f}" if cluster.avg_corr is not None else "n/a"
+        mx = f"{cluster.max_corr:.3f}" if cluster.max_corr is not None else "n/a"
+        print(
+            f"{cluster.cluster_id:>7} {cluster.size:>4} "
+            f"{cluster.representative_id:>14} {cluster.submitted_count:>9} "
+            f"{avg:>8} {mx:>8} {str(cluster.saturated):>9}  "
+            f"{cluster.theme or ''}"
+        )
+    print(f"\n{len(clusters)} cluster(s); edges are pairwise SELF rows only "
+          f"(SELF_MAX aggregates never enter the graph).")
     return EXIT_OK
 
 
@@ -730,6 +825,12 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_context(registry, args, log)
             if args.command == "report":
                 return cmd_report(registry, config, args, log)
+            if args.command == "refresh-corr":
+                return cmd_refresh_corr(registry, config, args, log)
+            if args.command == "backfill-corr":
+                return cmd_backfill_corr(registry, config, args, log)
+            if args.command == "clusters":
+                return cmd_clusters(registry, config, args, log)
             log.error("unknown command: %s", args.command)
             return EXIT_USAGE_ERROR
     except (ConfigError, FileNotFoundError) as exc:

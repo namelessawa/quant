@@ -11,8 +11,17 @@ schema change therefore:
 The version is tracked with SQLite's native ``PRAGMA user_version`` (plus a
 ``schema_meta`` table for human-readable bookkeeping). Python-level backfills
 that need the expression parser/family resolver live in
-:meth:`FactorRegistry._backfill_v2`; this module owns only backup, DDL and the
-pure-SQL part of the backfill.
+:meth:`FactorRegistry._backfill_v2` / :meth:`FactorRegistry._backfill_v3`; this
+module owns only backup, DDL and the pure-SQL part of the backfill.
+
+Migration history:
+
+* v1 -> v2: signal/experiment/family-template hashes, failure/corr/theme
+  columns, operator paths/multisets, factor_subtrees.
+* v2 -> v3: three-layer identity (``expression_hash`` added, ``signal_hash``
+  recomputed to include region/universe/delay), plus correlation-refresh
+  bookkeeping columns (``corr_last_checked_at`` / ``corr_check_attempts`` /
+  ``corr_error``).
 """
 
 from __future__ import annotations
@@ -22,10 +31,10 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
-#: New factors columns (name -> SQL declaration), applied additively.
-FACTOR_COLUMNS: dict[str, str] = {
+#: New factors columns added by the v1 -> v2 migration.
+FACTOR_COLUMNS_V2: dict[str, str] = {
     "signal_hash": "TEXT",
     "experiment_hash": "TEXT",
     "family_template_hash": "TEXT",
@@ -43,6 +52,19 @@ FACTOR_COLUMNS: dict[str, str] = {
     "subtheme": "TEXT",
 }
 
+#: New factors columns added by the v2 -> v3 migration.
+FACTOR_COLUMNS_V3: dict[str, str] = {
+    # Mathematical-expression identity (settings-independent). The v2
+    # signal_hash was expression-only; v3 keeps this layer explicitly and
+    # redefines signal_hash to include region/universe/delay.
+    "expression_hash": "TEXT",
+    # Correlation-refresh bookkeeping so UNKNOWN never becomes a permanent,
+    # undiagnosable black hole.
+    "corr_last_checked_at": "TEXT",
+    "corr_check_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "corr_error": "TEXT",
+}
+
 FEATURE_COLUMNS: dict[str, str] = {
     "operator_paths_json": "TEXT",
     "operator_multiset_json": "TEXT",
@@ -57,7 +79,7 @@ COMBINATION_COLUMNS: dict[str, str] = {
     "structure_hash": "TEXT",
 }
 
-_EXTRA_DDL = """
+_EXTRA_DDL_V2 = """
 CREATE TABLE IF NOT EXISTS factor_subtrees (
     factor_id           INTEGER NOT NULL REFERENCES factors(id) ON DELETE CASCADE,
     subtree_index       INTEGER NOT NULL,
@@ -87,6 +109,13 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 );
 """
 
+#: Objects introduced by v2 -> v3 (depends on the expression_hash column).
+_EXTRA_DDL_V3 = """
+CREATE INDEX IF NOT EXISTS idx_factors_expression_hash   ON factors(expression_hash);
+"""
+
+_EXTRA_DDL = _EXTRA_DDL_V2 + _EXTRA_DDL_V3
+
 
 def user_version(conn: sqlite3.Connection) -> int:
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -113,17 +142,31 @@ def _add_columns(
     return added
 
 
-def _backup_database(db_path: Path, log: Any) -> Path | None:
-    """One-time safety copy. An existing backup is never overwritten."""
+def _has_factors_table(conn: sqlite3.Connection) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='factors'"
+        ).fetchone()
+    )
+
+
+def _backup_database(db_path: Path, log: Any, from_version: int) -> Path | None:
+    """One-time safety copy, named after the version being upgraded FROM.
+
+    An existing backup is never overwritten, so interrupted/repeated upgrades
+    always preserve the pristine pre-migration file.
+    """
     if not db_path.exists():
         return None
-    backup = db_path.with_name(db_path.name + f".v{SCHEMA_VERSION - 1}.bak")
+    backup = db_path.with_name(db_path.name + f".v{from_version}.bak")
     if backup.exists():
         log.info("registry migration backup already exists: %s", backup)
         return backup
     shutil.copy2(db_path, backup)
-    log.warning("factor registry backed up before v%d migration: %s",
-                SCHEMA_VERSION, backup)
+    log.warning(
+        "factor registry backed up before v%d migration: %s",
+        from_version + 1, backup,
+    )
     return backup
 
 
@@ -131,39 +174,36 @@ def ensure_migrated(
     conn: sqlite3.Connection,
     db_path: str | Path,
     log: Any,
-) -> bool:
-    """Bring the database to :data:`SCHEMA_VERSION`.
+) -> dict[str, Any]:
+    """Bring the database up to :data:`SCHEMA_VERSION`.
 
-    Returns ``True`` only when this call actually upgraded a pre-v2 database.
-    Safe to call on a freshly-created v2 database.
+    Returns ``{"from_version", "to_version", "levels"}`` where ``levels`` lists
+    the migration levels applied during THIS call (subset of ``{2, 3}``); an
+    empty list means the database was already current. Safe to call on a
+    freshly-created latest-schema database.
     """
     path = Path(db_path)
     version = user_version(conn)
+    result: dict[str, Any] = {
+        "from_version": version, "to_version": version, "levels": []
+    }
     if version >= SCHEMA_VERSION:
         # Still make sure additive objects exist (they are all IF NOT EXISTS).
         conn.executescript(_EXTRA_DDL)
         conn.commit()
-        return False
+        return result
 
-    upgraded = False
+    populated = _has_factors_table(conn)
+
     if version < 2:
-        # Only an existing, populated pre-v2 file needs the safety copy.
-        existing_tables = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "factors" in existing_tables:
-            _backup_database(path, log)
-        added_factors = _add_columns(conn, "factors", FACTOR_COLUMNS)
-        added_features = _add_columns(conn, "factor_features", FEATURE_COLUMNS)
-        added_combos = _add_columns(
-            conn, "factor_combinations", COMBINATION_COLUMNS
-        )
-        conn.executescript(_EXTRA_DDL)
+        if populated:
+            _backup_database(path, log, version or 1)
+        added_factors = _add_columns(conn, "factors", FACTOR_COLUMNS_V2)
+        _add_columns(conn, "factor_features", FEATURE_COLUMNS)
+        _add_columns(conn, "factor_combinations", COMBINATION_COLUMNS)
+        conn.executescript(_EXTRA_DDL_V2)
 
-        # Pure-SQL backfills. experiment_hash is defined identically to the
+        # Pure-SQL backfill. experiment_hash is defined identically to the
         # historical exact_hash (SHA256 over canonical expr + settings); the
         # parser-dependent signal/family/template hashes are filled in by
         # FactorRegistry._backfill_v2().
@@ -172,16 +212,30 @@ def ensure_migrated(
                 "UPDATE factors SET experiment_hash = exact_hash "
                 "WHERE experiment_hash IS NULL"
             )
-
-        conn.execute(
-            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-            ("schema_version", str(SCHEMA_VERSION)),
-        )
         conn.execute("PRAGMA user_version = 2")
-        conn.commit()
-        upgraded = True
-        log.info(
-            "registry migrated to schema v2 (factor +%d, feature +%d, combo +%d)",
-            len(added_factors), len(added_features), len(added_combos),
-        )
-    return upgraded
+        result["levels"].append(2)
+        log.info("registry migrated to schema v2 (factor +%d)", len(added_factors))
+
+    if version < 3:
+        if populated:
+            # A v1 database jumping straight to v3 was already backed up above
+            # (.v1.bak); do not take a second copy in the same upgrade.
+            if 2 not in result["levels"]:
+                _backup_database(path, log, 2)
+        added_v3 = _add_columns(conn, "factors", FACTOR_COLUMNS_V3)
+        conn.executescript(_EXTRA_DDL_V3)
+        # expression_hash requires SHA256 of the canonical expression, and
+        # signal_hash must be recomputed to include region/universe/delay (v2
+        # stored an expression-only hash). SQLite computes neither portably, so
+        # FactorRegistry._backfill_v3() performs the Python backfill.
+        conn.execute("PRAGMA user_version = 3")
+        result["levels"].append(3)
+        log.info("registry migrated to schema v3 (factor +%d)", len(added_v3))
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+        ("schema_version", str(SCHEMA_VERSION)),
+    )
+    conn.commit()
+    result["to_version"] = SCHEMA_VERSION
+    return result

@@ -26,8 +26,11 @@ from ..exceptions import StorageError
 from ..hashing import (
     _HASH_SEPARATOR,
     dedup_key,
+    experiment_identity,
     expression_hash,
+    expression_identity,
     normalize_expression,
+    signal_identity,
 )
 from ..logging_utils import get_logger
 from ..storage import utcnow_iso
@@ -134,7 +137,12 @@ CREATE TABLE IF NOT EXISTS factors (
     nearest_cluster_id   INTEGER,
     theme                TEXT,
     branch               TEXT,
-    subtheme             TEXT
+    subtheme             TEXT,
+    -- v3 identity layer -----------------------------------------------------
+    expression_hash      TEXT,
+    corr_last_checked_at TEXT,
+    corr_check_attempts  INTEGER NOT NULL DEFAULT 0,
+    corr_error           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS factor_metrics (
@@ -331,15 +339,23 @@ class FactorRegistry:
                     # shape, so stamp it directly and skip backup/migration.
                     self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 self._conn.commit()
-                upgraded = ensure_migrated(self._conn, self.db_path, self.log)
-                if upgraded:
+                migration = ensure_migrated(self._conn, self.db_path, self.log)
+                levels = migration.get("levels") or []
+                if 2 in levels:
                     self._backfill_v2()
                 else:
-                    # Cheap repair path for interrupted upgrades.
+                    # Cheap repair path for interrupted v1->v2 upgrades.
                     if self._query(
                         "SELECT COUNT(*) AS n FROM factors WHERE signal_hash IS NULL"
                     )[0]["n"]:
                         self._backfill_v2()
+                if 3 in levels:
+                    self._backfill_v3()
+                elif self._query(
+                    "SELECT COUNT(*) AS n FROM factors WHERE expression_hash IS NULL"
+                )[0]["n"]:
+                    # Repair path for an interrupted v2->v3 upgrade.
+                    self._backfill_v3()
                 self._conn.execute(
                     "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
                     ("schema_version", str(SCHEMA_VERSION)),
@@ -406,15 +422,20 @@ class FactorRegistry:
             features.fields, features.operators, resolver=self.resolver
         )
         combinations = self._combinations_for(canonical)
-        signal = expression_hash(canonical)
+        # Unified three-layer identity (worldquant.hashing is the single
+        # source of truth shared with ResultStore):
+        #   expression — mathematical expression alone
+        #   signal     — expression + region/universe/delay (information set)
+        #   experiment — expression + every normalized setting
+        expression_id = expression_identity(canonical)
+        signal_id = signal_identity(canonical, normalized)
+        experiment_id = experiment_identity(canonical, normalized)
 
         return {
             "exact_hash": exact,
-            # experiment_hash: same expression under the same normalized
-            # settings — intentionally identical to the historical exact_hash.
-            "experiment_hash": exact,
-            # signal_hash: expression identity alone, independent of settings.
-            "signal_hash": signal,
+            "experiment_hash": experiment_id,
+            "signal_hash": signal_id,
+            "expression_hash": expression_id,
             "canonical": canonical,
             "template_hash": _sha256(features.template + _HASH_SEPARATOR + scope),
             "structure_hash": _sha256(features.structure),
@@ -510,9 +531,9 @@ class FactorRegistry:
                 source, parent_factor_id,
                 signal_hash, experiment_hash, family_template_hash,
                 ablation_group_id, changed_parameters_json, parent_experiment_id,
-                theme, branch, subtheme
+                theme, branch, subtheme, expression_hash
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 exact_hash, expression, fp["canonical"],
@@ -531,6 +552,7 @@ class FactorRegistry:
                 theme_parts[0] if theme_parts else None,
                 theme_parts[1] if len(theme_parts) > 1 else None,
                 theme_parts[2] if len(theme_parts) > 2 else None,
+                fp["expression_hash"],
             ),
         )
         factor_id = int(cursor.lastrowid)
@@ -1009,6 +1031,125 @@ class FactorRegistry:
             )
             written += 1
         return written
+
+    def reconcile_correlation_neighbors(self) -> dict[str, int]:
+        """Resolve stored neighbor BRAIN alpha ids to local factor ids.
+
+        A simulation stored before the neighbor alpha itself was imported has
+        ``other_brain_alpha_id`` but NULL ``other_factor_id``. Once the neighbor
+        is imported later (brain_alpha_id known), this backfills the link. It
+        is idempotent and safe to run after every import/refresh. Duplicate
+        edges created by merging an orphan remote row with a newly-resolved
+        local row are collapsed, keeping the strongest (highest |corr|).
+        """
+        resolved = self._execute(
+            """
+            UPDATE factor_correlations
+               SET other_factor_id = (
+                       SELECT f.id FROM factors f
+                        WHERE f.brain_alpha_id =
+                              factor_correlations.other_brain_alpha_id
+                        LIMIT 1
+                   )
+             WHERE other_factor_id IS NULL
+               AND other_brain_alpha_id IS NOT NULL
+               AND EXISTS (
+                       SELECT 1 FROM factors f
+                        WHERE f.brain_alpha_id =
+                              factor_correlations.other_brain_alpha_id
+                   )
+            """
+        ).rowcount
+        deduped = self._execute(
+            """
+            DELETE FROM factor_correlations
+             WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, ROW_NUMBER() OVER (
+                         PARTITION BY factor_id, other_factor_id, correlation_type
+                         ORDER BY abs_correlation DESC, id
+                     ) AS rn
+                     FROM factor_correlations
+                     WHERE other_factor_id IS NOT NULL
+                 ) WHERE rn > 1
+             )
+            """
+        ).rowcount
+        if resolved or deduped:
+            self.log.info(
+                "correlation neighbor reconciliation: resolved=%d deduped=%d",
+                resolved, deduped,
+            )
+        return {"resolved": int(resolved or 0), "deduped": int(deduped or 0)}
+
+    def list_unresolved_corr_factors(
+        self, *, limit: int | None = None, alpha_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """SIMULATED factors with brain ids whose corr verdict is still UNKNOWN.
+
+        Ordered by fewest refresh attempts first so persistently-failing ids
+        never starve newer ones.
+        """
+        sql = [
+            "SELECT * FROM factors",
+            "WHERE brain_alpha_id IS NOT NULL",
+            "  AND status = ?",
+            "  AND COALESCE(corr_status, ?) = ?",
+        ]
+        params: list[Any] = [
+            FactorStatus.SIMULATED,
+            CorrelationStatus.UNKNOWN.value,
+            CorrelationStatus.UNKNOWN.value,
+        ]
+        if alpha_id:
+            sql.append("  AND brain_alpha_id = ?")
+            params.append(alpha_id)
+        sql.append("ORDER BY corr_check_attempts ASC, id ASC")
+        if limit:
+            sql.append("LIMIT ?")
+            params.append(int(limit))
+        return [dict(row) for row in self._query("\n".join(sql), tuple(params))]
+
+    def list_corr_backfill_targets(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Factors with a brain id but no per-neighbor (SELF) correlation rows."""
+        rows = self._query(
+            """
+            SELECT * FROM factors
+             WHERE brain_alpha_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM factor_correlations c
+                    WHERE c.factor_id = factors.id
+                      AND c.correlation_type = ?
+               )
+             ORDER BY id DESC
+             LIMIT ?
+            """,
+            (CORR_TYPE_SELF, int(limit)),
+        )
+        return [dict(row) for row in rows]
+
+    def mark_corr_checked(
+        self, factor_id: int, *, error: str | None = None
+    ) -> None:
+        """Record one correlation refresh attempt (success or failure)."""
+        if error:
+            self._execute(
+                """
+                UPDATE factors SET corr_check_attempts = corr_check_attempts + 1,
+                                   corr_last_checked_at = ?, corr_error = ?
+                 WHERE id = ?
+                """,
+                (utcnow_iso(), str(error)[:500], factor_id),
+            )
+        else:
+            self._execute(
+                """
+                UPDATE factors SET corr_check_attempts = corr_check_attempts + 1,
+                                   corr_last_checked_at = ?, corr_error = NULL
+                 WHERE id = ?
+                """,
+                (utcnow_iso(), factor_id),
+            )
 
     def apply_correlation_gate(self, factor_id: int) -> CorrelationDecision:
         """Compare against the protected set and record PASSED/CORR_REJECTED."""
@@ -1929,6 +2070,35 @@ class FactorRegistry:
                 "UPDATE factors SET high_quality_redundant = 1 WHERE id = ?",
                 (factor_id,),
             )
+
+    def _backfill_v3(self) -> None:
+        """Fill the v3 identity columns for every factor.
+
+        ``expression_hash`` is COALESCE-filled; ``signal_hash`` is recomputed
+        unconditionally because the v2 definition was expression-only while v3
+        scopes it by region/universe/delay. Both hashes come straight from
+        :mod:`worldquant.hashing` (no expression parser needed), so this is
+        cheap enough to rerun wholesale and safe to interrupt/resume.
+        """
+        rows = self._query(
+            "SELECT id, canonical_expression, settings_json FROM factors"
+        )
+        updated = 0
+        for row in rows:
+            canonical = row["canonical_expression"] or ""
+            settings = _loads(row["settings_json"], {})
+            self._execute(
+                """
+                UPDATE factors
+                   SET expression_hash = COALESCE(expression_hash, ?),
+                       signal_hash = ?
+                 WHERE id = ?
+                """,
+                (expression_hash(canonical), signal_identity(canonical, settings),
+                 row["id"]),
+            )
+            updated += 1
+        self.log.info("registry v3 identity backfill applied to %d factors", updated)
 
     def _backfill_combo_legs(self, factor_ids: list[int]) -> None:
         """Attach per-leg hashes to combination rows (old + new factors)."""

@@ -346,6 +346,70 @@ submittables `A10GZ5ge` (GOOD 0.5909) and `Vk627oWY` (GOOD 0.6987, knife-edge).
 Detrended-analyst-core is CLOSED while the four submissions stand; future
 rounds should start from the ts_rank level core or other non-analyst cores.
 
+**Rounds 34–37 (2026-09-12): the user submitted `2rOjd9Vx`, which POISONED its
+whole family — and the fitness/self-corr frontier of the ts_rank analyst family
+is now exactly mapped.** Account submissions: five (`2rOn70lb`, `vRkN3qzd`,
+`9qVXrMle`, `MP1pYp0o`, **`2rOjd9Vx`**).
+
+1. **A submission kills its unsubmitted relatives.** After `2rOjd9Vx` went in,
+   fresh checks on the 09-10 pool returned: `0mRjOl18` 0.9738, `vRkOwYaG`
+   0.9664, `wpY9g3rp` 0.9421, `A10GZ5ge` 0.8682, `gJQWkgjO` 0.7318 — all FAIL.
+   Only `Vk627oWY` (option8 family, no analyst core) survived at 0.6987.
+   Stored `8/8 PASS` rows are CACHED snapshots: `2rOjd9Vx` kept returning its
+   old 0.6280 for a while while sibling checks were stuck unresolved/recomputing.
+   **Always recheck before submitting anything whose relatives exist in the
+   account.**
+2. **The measured sc ladder (all decay≈5–7, trunc 0.01, delay 1):**
+
+| recipe (core r = gz(win(ts_rank(s,K),3),subindustry)) | fit | sc |
+| --- | --- | --- |
+| r2+r+c+p (k120) — the submitted 2rOjd9Vx shape | 2.09 | (submitted) |
+| r3+r+c+p (k120) | 2.14 | 0.9891 |
+| r3+r+c+o (p→o swap) | 2.03 | 0.8784 |
+| r3+r+u+p (c→u swap) | 1.73 | 0.7526 |
+| r3+r+u+o (k120, FULL swap) | 1.76 | ~0.727 |
+| **r4+r+u+o k250** | **2.03–2.07** | **0.741–0.744 FAIL** |
+| r4+r+u+o k350 | 1.94 | 0.7194 FAIL |
+| **r3+r+u+o k250 d5/d7** | **1.86–1.90** | **0.685–0.687 PASS** |
+| r4+r+u+o k500 | 1.78 | 0.6866 PASS |
+| r2+r+u+o k120 | 1.48 | 0.6505 PASS |
+
+   **The EXCELLENT+ point (fit ≥2.0 AND sc ≤0.7) is unreachable inside this
+   family** — every +0.1 fitness from r-weight costs ~+0.04–0.06 sc, and the
+   frontier crosses the 0.7 line between fit 1.94 and 2.03. u = `rel_num_all`
+   (near-static, 0.7% turnover — mechanically uncorrelated PnL, the best
+   diluter), o = `operating_income/cap`. Slower rank windows (k250→k500) shave
+   ~0.03–0.05 sc AND raise fitness ~+0.1 (k250 > k120 > k60); d5 adds ~+0.04
+   fit over d7 at neutral sc. c (rel_ret_comp) is the correlation carrier:
+   keeping it costs +0.15 sc at r3.
+3. **Today's submittable finds (all GOOD 8/8, one family — realistically ONE
+   submission slot before the others die):** `WjP3AaPO` (r3+u+o
+   k250 d5, fit 1.90 sc 0.6872, best), `KPOvGX7N` (same k250 d7, 1.86/0.6851),
+   `E5vNlOqR` (r4+u+u+o k250 d7, 1.80/0.6593), `akLe7vew` (r4+u+o k500 d7,
+   1.78/0.6866), `blRJQdkp` (r3+u+o+o k250 d7, 1.52/0.6582). Plus pre-existing
+   `Vk627oWY` (GOOD 1.53, 0.6987).
+4. **Dead ends measured today:** window/weight tweaks inside the r2+c+p family
+   (c5/c20/p10/p2/k60/k250/sub — all 0.93–0.997); c as CORE `c+c+c+r+p`
+   (INFERIOR 0.87, rel_ret_comp standalone too weak, 19.7% turnover); product
+   form `r*c*p` (INFERIOR, sh −0.38); s2=ey+np+opinc as core (AVERAGE 1.42);
+   socialmedia8 `snt_social_value` standalone ±0.37; news12 is VECTOR/event
+   type (news18 trap again, skipped); fundamental2 `accrued_liabilities_total`
+   Δ66d/cap negated (flipped +0.44, book 736/577) and
+   `accumulated_depreciation_depletion_amortization_ppne/cap` negated (flipped
+   +0.92, turnover 1.1%, book 1711/718 — a possible future slow leg, but low
+   coverage/unbalanced-book risk).
+5. **Dataset discovery works via the API**: `GET {base}/data-sets` and
+   `/data-fields?dataset.id=...&orderBy=alphaCount&dir=DESC` (needs absolute
+   URL through `client.get_json`). 14 datasets visible on this entitlement;
+   unused: fundamental2 (766 fields), news12 (875, VECTOR-heavy), socialmedia8
+   (4 fields), univ1 (universe selectors only).
+
+**Next move for EXCELLENT+:** the analyst ts_rank family is saturated at its
+frontier; a NEW fitness engine (standalone sh ≥ 1.0 from unmined data) or a
+fundamentally different construction is required. Datasets probed on 09-12
+(socialmedia8, fundamental2 accruals/D&A, news12) yielded nothing above 0.92
+standalone and that one is unbalanced/static.
+
 Three structural changes were required — round 14 tried the same option fields
 with the analyst recipe and got **10/10 INFERIOR**:
 

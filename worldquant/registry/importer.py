@@ -260,5 +260,11 @@ def import_submitted_factors(
         else:
             summary["imported"] += 1
 
+    # Importing the live set may finally reveal local factors behind
+    # previously-orphan BRAIN neighbor ids; link those graph edges now.
+    reconciliation = registry.reconcile_correlation_neighbors()
+    summary["neighbors_resolved"] = reconciliation["resolved"]
+    summary["edges_deduped"] = reconciliation["deduped"]
+
     log.info("submitted-alpha import: %s", json.dumps(summary))
     return summary

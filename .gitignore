@@ -21,6 +21,8 @@ __pycache__/
 
 # local artifacts
 data/*.db
+data/*.db.bak
+data/*.bak
 data/*.sqlite3
 data/results.csv
 data/passed.csv

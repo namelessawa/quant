@@ -1,4 +1,6 @@
 {
+ "accrued_liabilities_total": "fundamental2",
+ "accumulated_depreciation_depletion_amortization_ppne": "fundamental2",
  "analyst_revision_rank_derivative": "model16",
  "anl4_adjusted_netincome_ft": "analyst4",
  "anl4_ebit_value": "analyst4",
@@ -64,6 +66,7 @@
  "returns": "pv1",
  "scl12_buzz": "socialmedia12",
  "scl12_sentiment": "socialmedia12",
+ "snt_social_value": "socialmedia8",
  "systematic_risk_last_30_days": "model51",
  "systematic_risk_last_360_days": "model51",
  "unsystematic_risk_last_30_days": "model51",

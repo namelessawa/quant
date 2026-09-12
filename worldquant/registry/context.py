@@ -222,12 +222,18 @@ def _do_not_repeat(
 
 
 def _successful_examples(registry: FactorRegistry, limit: int) -> list[dict[str, Any]]:
-    """One PASSED/SUBMITTED example per correlation cluster, best first."""
+    """One PASSED/SUBMITTED example per correlation cluster, best first.
+
+    Only factors that cleared BOTH the metric and research-correlation gates
+    count as success. A SIMULATED factor with corr_status=UNKNOWN is unverified
+    evidence, no matter how good its sharpe/fitness look, so it is never offered
+    to a generator as a "successful diverse" pattern. High-quality but
+    corr-rejected factors surface separately as high_quality_redundant examples.
+    """
     representatives = get_cluster_representatives(registry)
     examples = [
         item for item in representatives
         if item["status"] in (FactorStatus.PASSED, FactorStatus.SUBMITTED)
-        or (item["sharpe"] is not None and item["fitness"] is not None)
     ]
     examples.sort(
         key=lambda item: (

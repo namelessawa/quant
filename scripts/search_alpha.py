@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import sys
 from contextlib import nullcontext
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -43,19 +42,21 @@ from worldquant import (  # noqa: E402
     WorldQuantClient,
     WorldQuantError,
     build_ledger,
-    gate_candidate,
+    describe_corr_verdicts,
+    evaluate_acceptance,
+    gate_specs,
     get_logger,
     load_alphas,
     load_config,
     open_registry,
-    record_completed,
+    record_results,
     require_credentials,
     scope_hash,
     setup_logging,
     specs_from_expressions,
 )
 from worldquant.api import SUBMISSION_CHECKS, SimulationStatus, passed_check_count  # noqa: E402
-from worldquant.config import ConfigError  # noqa: E402
+from worldquant.config import ConfigError, apply_storage_overrides  # noqa: E402
 from worldquant.generator import CombinatorialGenerator  # noqa: E402
 from worldquant.models import AlphaSpec  # noqa: E402
 
@@ -389,12 +390,12 @@ def main(argv: list[str] | None = None) -> int:
             overrides["settings"] = setting_overrides
         config = load_config(args.config, overrides=overrides, credentials_path=args.credentials)
         storage_overrides = {
-            key: Path(value)
+            key: value
             for key, value in (("db_path", args.db), ("log_file", args.log_file))
             if value
         }
         if storage_overrides:
-            config = replace(config, storage=replace(config.storage, **storage_overrides))
+            config = apply_storage_overrides(config, **storage_overrides)
         setup_logging(config.storage.log_file, args.log_level or config.storage.log_level)
         credentials = require_credentials(config)
     except ConfigError as exc:
@@ -494,13 +495,32 @@ def main(argv: list[str] | None = None) -> int:
                 report_hit(best, log, attempts=0)
                 return EXIT_FOUND
 
-        # No two identical alphas. "Identical" means the same expression over the
-        # same information set: region, universe and delay decide what is
-        # predicted and with what latency, so the same signal in TOP1000 is a
-        # different alpha. The remaining settings are portfolio construction —
-        # one expression run under two truncation values once produced
-        # effectively identical results (both fitness 2.07) and wasted quota, so
-        # those still do not make a new alpha.
+        # The Registry research gate runs FIRST, before the ResultStore
+        # execution-dedup: every candidate must be visible to research memory
+        # (duplicate attempts, explicit ablation sweeps), and a scope-hash hit
+        # in the local store must not hide a candidate from the gate. Blocked
+        # candidates get a Registry row (status/reason/novelty) but never a
+        # fake ResultStore execution.
+        if specs:
+            gate_result = gate_specs(registry, specs, log=log)
+            specs = gate_result.kept
+            if registry is not None and not specs:
+                log.info(
+                    "Every candidate is a known duplicate or a saturated "
+                    "low-novelty variant; nothing new to simulate."
+                )
+                return EXIT_NOT_FOUND
+
+        # ResultStore dedup comes SECOND and answers a narrower question —
+        # "does this exact information set already have a real simulation
+        # execution?" — rather than "is this a worthwhile research attempt?".
+        # "Identical" means the same expression over the same information set:
+        # region, universe and delay decide what is predicted and with what
+        # latency, so the same signal in TOP1000 is a different alpha. The
+        # remaining settings are portfolio construction — one expression run
+        # under two truncation values once produced effectively identical
+        # results (both fitness 2.07) and wasted quota, so those still do not
+        # make a new alpha.
         already_run = store.simulated_scope_hashes()
         if already_run:
             before = len(specs)
@@ -523,41 +543,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return EXIT_NOT_FOUND
             specs = specs[: args.max_attempts]
-
-        if registry is not None and specs:
-            # Factor memory gate: exact expression+settings duplicates are hard
-            # rejected; candidates whose template is saturated AND novelty is
-            # below the configured floor are skipped. Every decision is
-            # recorded in factor_registry.db.
-            kept: list[AlphaSpec] = []
-            gate_tally: dict[str, int] = {}
-            for spec in specs:
-                _, decision = gate_candidate(
-                    registry,
-                    spec.expression,
-                    spec.settings,
-                    source=getattr(spec, "source", None),
-                    force=bool(getattr(spec, "force_gate", False)),
-                    ablation_group_id=getattr(spec, "ablation_group_id", None),
-                    changed_parameters=getattr(spec, "changed_parameters", None),
-                )
-                if decision is None or decision.passed:
-                    kept.append(spec)
-                else:
-                    gate_tally[decision.action] = gate_tally.get(decision.action, 0) + 1
-            blocked = len(specs) - len(kept)
-            if blocked:
-                log.info(
-                    "Registry gate skipped %d/%d candidate(s): %s",
-                    blocked, len(specs), gate_tally,
-                )
-            specs = kept
-            if not specs:
-                log.info(
-                    "Every remaining candidate is a known duplicate or a "
-                    "saturated low-novelty variant; nothing new to simulate."
-                )
-                return EXIT_NOT_FOUND
 
         chunk_size = max(1, min(config.runner.concurrency, len(specs)))
         log.info("Running %d candidate(s), %d at a time", len(specs), chunk_size)
@@ -596,29 +581,70 @@ def main(argv: list[str] | None = None) -> int:
                         log.warning("  %-10s %s (%s)", result.status, result.expression[:50],
                                     (result.error or "")[:120])
 
-                    # Fold the attempt into factor memory (metrics, rejection or
-                    # correlation verdict). Never blocks the search loop.
+                    # Fold the attempt into factor memory FIRST: the research
+                    # corr verdict is part of acceptance, not bookkeeping that
+                    # happens after the decision. Never blocks the search loop.
+                    outcome: dict[str, Any] | None = None
                     if registry is not None:
-                        record_completed(registry, result)
+                        outcome = record_results(registry, [result])[0][1]
 
                     if not grade_meets_target(grade, target):
                         continue
 
-                    if result.is_submittable:
+                    corr_cfg = (
+                        registry.config.correlation if registry is not None else None
+                    )
+                    # With the registry disabled (--no-registry) there is no
+                    # research verdict at all, so fall back to the BRAIN-only
+                    # rule. With it enabled, UNKNOWN rejects unless the operator
+                    # explicitly sets allow_submit_without_corr.
+                    allow_unknown = (
+                        registry is None
+                        or bool(getattr(corr_cfg, "allow_submit_without_corr", False))
+                    )
+                    acceptance = evaluate_acceptance(
+                        result,
+                        outcome,
+                        grade_ok=True,
+                        allow_unknown=allow_unknown,
+                        corr_config=corr_cfg,
+                    )
+                    if acceptance.accepted:
                         report_hit(result, log, attempts=attempted)
                         log.info("Grade tally so far: %s", grade_tally)
                         return EXIT_FOUND
 
-                    # Grade alone is not acceptance. Log why it was rejected so
-                    # the failing check can inform the next candidate, then keep
-                    # searching: abandoning this one and trying another is the
-                    # point of the loop.
-                    log.warning(
-                        "  %s graded %s but is NOT submittable - %s; abandoning it "
-                        "and continuing the search",
-                        result.remote_alpha_id or result.alpha_id, grade,
-                        describe_submission(result),
-                    )
+                    # Grade clears the target but the alpha is not a find. Say
+                    # exactly which of the two independent gates rejected it so
+                    # a value like 0.68 (PASS vs BRAIN 0.70, FAIL vs research
+                    # 0.65) never looks like contradictory program logic.
+                    if not result.is_submittable:
+                        log.warning(
+                            "  %s graded %s but is NOT submittable - %s; abandoning it "
+                            "and continuing the search",
+                            result.remote_alpha_id or result.alpha_id, grade,
+                            describe_submission(result),
+                        )
+                    else:
+                        log.warning(
+                            "  %s graded %s passes BRAIN submission checks but is "
+                            "NOT accepted by the local research gate; abandoning "
+                            "it and continuing the search",
+                            result.remote_alpha_id or result.alpha_id, grade,
+                        )
+                        log.warning(
+                            "  %s",
+                            describe_corr_verdicts(result, outcome, corr_config=corr_cfg),
+                        )
+                        if acceptance.research_corr_status == "UNKNOWN":
+                            log.warning(
+                                "  GOOD alpha found but correlation unresolved; "
+                                "not accepted."
+                            )
+                        log.warning(
+                            "Rejected by local diversity gate despite official "
+                            "BRAIN submission pass."
+                        )
 
                 if attempted >= args.max_attempts:
                     log.info("Reached the --max-attempts cap of %d", args.max_attempts)
