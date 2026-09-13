@@ -392,6 +392,89 @@ class TestResearchCorrelationCutoff:
         assert decision.accepted is False
         assert "UNKNOWN" in decision.reason
 
+    # ------------------------------------------------------------------ #
+    # Persisted corr_status on a SUBMITTED factor: the lifecycle fallback
+    # must NOT be used, because SUBMITTED is neither PASSED nor SIMULATED.
+    # Without the fix these all fall through to "not evaluated".
+    # ------------------------------------------------------------------ #
+    def test_submitted_with_stored_pass_is_accepted(self):
+        result = make_result(EXPR, self_corr=0.40, alpha_id="BRA-P")
+        outcome = {
+            "factor_id": 1,
+            "status": FactorStatus.SUBMITTED,
+            "corr_status": "PASS",
+            "correlation_decision": None,
+        }
+        decision = evaluate_acceptance(
+            result, outcome, grade_ok=True,
+            corr_config=RegistryConfig().correlation,
+        )
+        assert decision.research_corr_status == "PASS"
+        assert decision.accepted is True
+
+    def test_submitted_with_stored_fail_is_rejected(self):
+        result = make_result(EXPR, self_corr=0.68, alpha_id="BRA-F")
+        outcome = {
+            "factor_id": 1,
+            "status": FactorStatus.SUBMITTED,
+            "corr_status": "FAIL",
+            "correlation_decision": None,
+        }
+        decision = evaluate_acceptance(
+            result, outcome, grade_ok=True,
+            corr_config=RegistryConfig().correlation,
+        )
+        assert decision.research_corr_status == "FAIL"
+        assert decision.accepted is False
+        assert "research correlation FAIL" in decision.reason
+
+    def test_submitted_with_stored_unknown_rejects_by_default(self):
+        result = make_result(EXPR, self_corr=None, alpha_id="BRA-U")
+        outcome = {
+            "factor_id": 1,
+            "status": FactorStatus.SUBMITTED,
+            "corr_status": "UNKNOWN",
+            "correlation_decision": None,
+        }
+        decision = evaluate_acceptance(
+            result, outcome, grade_ok=True,
+            corr_config=RegistryConfig().correlation,
+        )
+        assert decision.research_corr_status == "UNKNOWN"
+        assert decision.accepted is False
+        assert "UNKNOWN" in decision.reason
+        # Explicit allow_unknown still rescues a genuinely-unknown historical alpha.
+        allowed = evaluate_acceptance(
+            result, outcome, grade_ok=True, allow_unknown=True,
+            corr_config=RegistryConfig().correlation,
+        )
+        assert allowed.accepted is True
+
+    def test_submitted_with_stored_not_applicable_uses_brain_checks(self):
+        # NOT_APPLICABLE means the local gate was off when this factor was
+        # recorded: acceptance depends solely on BRAIN's official checks.
+        result = make_result(EXPR, self_corr=0.68, alpha_id="BRA-NA")
+        outcome = {
+            "factor_id": 1,
+            "status": FactorStatus.SUBMITTED,
+            "corr_status": "NOT_APPLICABLE",
+            "correlation_decision": None,
+        }
+        decision = evaluate_acceptance(
+            result, outcome, grade_ok=True,
+            corr_config=RegistryConfig().correlation,
+        )
+        assert decision.research_corr_status == "NOT_APPLICABLE"
+        assert decision.accepted is True
+        # Brain-check failure is still rejected even with NOT_APPLICABLE.
+        result.submission_checks["SELF_CORRELATION"] = {"result": "FAIL"}
+        rejected = evaluate_acceptance(
+            result, outcome, grade_ok=True,
+            corr_config=RegistryConfig().correlation,
+        )
+        assert rejected.accepted is False
+        assert "BRAIN submission checks" in rejected.reason
+
 
 # --------------------------------------------------------------------------- #
 # Spec 33: ablation sweeps

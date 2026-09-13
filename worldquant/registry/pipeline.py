@@ -145,10 +145,26 @@ def _research_verdict(
         return None, None
     # The stored corr_status column is the authoritative verdict marker and
     # survives even when this call did not re-run the gate (e.g. a historical
-    # alpha re-evaluated via --include-existing).
+    # alpha re-evaluated via --include-existing). Any persisted verdict wins
+    # directly: a SUBMITTED factor recorded as PASS/FAIL/UNKNOWN must NOT be
+    # re-derived from its lifecycle state (SUBMITTED is neither PASSED nor
+    # SIMULATED, so the lifecycle fallback would wrongly report "not
+    # evaluated"). The decision object (when present) is still returned so
+    # describe_corr_verdicts can render band/margin for fresh gate runs.
     stored_corr = outcome.get("corr_status")
-    if stored_corr == CorrelationStatus.NOT_APPLICABLE.value:
-        return CorrelationStatus.NOT_APPLICABLE.value, None
+    known = {
+        CorrelationStatus.PASS.value,
+        CorrelationStatus.FAIL.value,
+        CorrelationStatus.UNKNOWN.value,
+        CorrelationStatus.NOT_APPLICABLE.value,
+    }
+    if stored_corr in known:
+        decision = outcome.get("correlation_decision")
+        return stored_corr, (
+            decision if isinstance(decision, CorrelationDecision) else None
+        )
+    # No persisted verdict: fall back to the in-memory decision object (fresh
+    # gate run) or infer from the lifecycle status.
     decision = outcome.get("correlation_decision")
     if isinstance(decision, CorrelationDecision):
         return decision.status.value, decision

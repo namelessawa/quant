@@ -1011,6 +1011,77 @@ class TestHistoricalAlphasResearchGate:
             ).fetchone()
         assert row == ("PASSED", "NOT_APPLICABLE")
 
+    def _seed_submitted(self, search, *, self_corr, alpha_id):
+        """Fold a result, then flip its lifecycle status to SUBMITTED.
+
+        This mimics a historical alpha that was submitted long ago: its
+        ``corr_status`` was persisted by the gate, but the lifecycle status is
+        no longer PASSED/CORR_REJECTED/SIMULATED. The include-existing path
+        must therefore trust the stored ``corr_status`` rather than infer from
+        the lifecycle state.
+        """
+        from worldquant.config import load_config
+        from worldquant.hashing import dedup_key
+        from worldquant.models import AlphaResult
+        from worldquant.registry import FactorStatus, open_registry, record_results
+
+        expression = "rank(stored)"
+        settings = {"region": "USA", "delay": 1}
+        db_path = self._seed(
+            search, self_corr=self_corr, alpha_id=alpha_id, expression=expression
+        )
+        cfg = self._registry_config(search)
+        app_cfg = load_config(str(cfg))
+        registry = open_registry(app_cfg)
+        try:
+            result = AlphaResult(
+                alpha_id="stored", expression=expression,
+                dedup_key=dedup_key(expression, settings),
+                status=SimulationStatus.COMPLETED,
+                remote_alpha_id=alpha_id,
+                sharpe=2.2, fitness=1.6, grade="GOOD",
+                long_count=1500, short_count=1400, passed=True,
+                submission_checks=all_pass_checks(),
+                self_correlation=self_corr,
+            )
+            outcome = record_results(registry, [result])[0][1]
+            registry.set_status(outcome["factor_id"], FactorStatus.SUBMITTED)
+            return db_path, cfg
+        finally:
+            registry.close()
+
+    def test_submitted_with_stored_pass_is_found(self, search):
+        db_path, cfg = self._seed_submitted(
+            search, self_corr=0.31, alpha_id="OLDSUBP"
+        )
+
+        class Exploding:
+            def __call__(self, method, url, kwargs):
+                raise AssertionError("stored SUBMITTED+PASS must short-circuit")
+
+        search["install"](Exploding())
+        code = search_alpha.main([
+            "--target-grade", "GOOD", "--include-existing",
+            "--config", str(cfg), "--max-attempts", "1",
+            "--db", str(db_path),
+            "--log-file", str(search["tmp_path"] / "s_subp.log"),
+            "--concurrency", "1", "--no-yearly",
+        ])
+        assert code == search_alpha.EXIT_FOUND
+
+    def test_submitted_with_stored_fail_is_not_found(self, search):
+        db_path, cfg = self._seed_submitted(
+            search, self_corr=0.68, alpha_id="OLDSUBF"
+        )
+        backend = grades_in_order("INFERIOR")
+        code = search["run"](
+            "--target-grade", "GOOD", "--include-existing",
+            "--config", str(cfg), "--max-attempts", "1", backend=backend,
+        )
+        assert code == search_alpha.EXIT_NOT_FOUND
+        logged = self._log(search)
+        assert "research correlation FAIL" in logged
+
 
 class TestAblationScopeDedup:
     """Ablation variants survive the scope_hash prefilter; normal rows don't."""
