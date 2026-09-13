@@ -203,3 +203,133 @@ class TestSpecsFromExpressions:
 
         assert AlphaSpec(expression="rank(close)").label == "rank(close)"
         assert AlphaSpec(expression="rank(close)", name="n").label == "n"
+
+
+class TestAblationMetadata:
+    """Optional ablation provenance columns/keys (spec: ablation full chain)."""
+
+    def test_plain_rows_have_no_ablation_metadata(self, tmp_path):
+        path = write(tmp_path, "a.csv", "name,expression\nx,rank(close)\n")
+        spec = load_alphas(path, default_settings=DEFAULTS)[0]
+        assert spec.source is None
+        assert spec.ablation_group_id is None
+        assert spec.changed_parameters is None
+        assert spec.parent_experiment_id is None
+        assert spec.is_ablation is False
+
+    def test_csv_reads_full_ablation_metadata_json_changes(self, tmp_path):
+        path = write(
+            tmp_path, "a.csv",
+            "expression,source,ablation_group_id,changed_parameters,parent_experiment_id,decay\n"
+            "rank(close),ablation,sweep-7,"
+            '"{""decay"": 8, ""truncation"": 0.05}",42,8\n',
+        )
+        spec = load_alphas(path, default_settings=DEFAULTS)[0]
+        assert spec.source == "ablation"
+        assert spec.is_ablation is True
+        assert spec.ablation_group_id == "sweep-7"
+        assert spec.changed_parameters == {"decay": 8, "truncation": 0.05}
+        assert spec.parent_experiment_id == 42
+        assert spec.settings["decay"] == 8
+
+    def test_csv_accepts_key_value_changed_parameters(self, tmp_path):
+        path = write(
+            tmp_path, "a.csv",
+            "expression,source,changed_parameters\n"
+            "rank(close),ablation,decay=8;neutralization=SUBINDUSTRY\n",
+        )
+        spec = load_alphas(path, default_settings=DEFAULTS)[0]
+        assert spec.source == "ablation"
+        assert spec.changed_parameters == {
+            "decay": 8, "neutralization": "SUBINDUSTRY"
+        }
+
+    def test_json_reads_full_ablation_metadata(self, tmp_path):
+        payload = [{
+            "expression": "rank(close)",
+            "source": "ablation",
+            "ablation_group_id": "g1",
+            "changed_parameters": {"decay": 12},
+            "parent_experiment_id": 7,
+        }]
+        path = write(tmp_path, "a.json", json.dumps(payload))
+        spec = load_alphas(path, default_settings=DEFAULTS)[0]
+        assert spec.source == "ablation"
+        assert spec.ablation_group_id == "g1"
+        assert spec.changed_parameters == {"decay": 12}
+        assert spec.parent_experiment_id == 7
+
+    def test_bad_parent_experiment_id_raises(self, tmp_path):
+        path = write(
+            tmp_path, "a.csv",
+            "expression,parent_experiment_id\nrank(close),not-an-int\n",
+        )
+        with pytest.raises(ConfigError):
+            load_alphas(path, default_settings=DEFAULTS)
+
+    def test_csv_ablation_specs_run_through_the_standard_gate(self, tmp_path):
+        # Scenario: the standard AlphaSpec/CSV ablation path must survive
+        # gate_specs end to end (same signal, different decay allowed; exact
+        # experiment duplicates still rejected, --force overrides).
+        from dataclasses import replace as dc_replace
+
+        from worldquant.registry import FactorRegistry, RegistryConfig, gate_specs
+
+        base = RegistryConfig()
+        cfg = dc_replace(
+            base,
+            pre_simulation=dc_replace(base.pre_simulation, max_signal_experiments=1),
+        )
+        registry = FactorRegistry(tmp_path / "fr.db", cfg)
+        try:
+            baseline = write(
+                tmp_path, "baseline.csv",
+                'expression,decay\n"rank(ts_delta(close, 5))",4\n',
+            )
+            ablations = write(
+                tmp_path, "ablations.csv",
+                'expression,source,ablation_group_id,changed_parameters,decay\n'
+                '"rank(ts_delta(close, 5))",ablation,s1,"{""decay"":8}",8\n'
+                '"rank(ts_delta(close, 5))",ablation,s1,"{""decay"":16}",16\n',
+            )
+            base_specs = load_alphas(baseline, default_settings=DEFAULTS)
+            sweep_specs = load_alphas(ablations, default_settings=DEFAULTS)
+            assert gate_specs(registry, base_specs).blocked == 0
+            result = gate_specs(registry, sweep_specs)
+            assert len(result.kept) == 2
+            assert result.blocked == 0
+
+            # "Exact duplicate" means an experiment that was actually
+            # researched: fold a completed result for the decay=8 variant
+            # locally (no simulation), then replay it.
+            from worldquant.api import SUBMISSION_CHECKS, SimulationStatus
+            from worldquant.hashing import experiment_identity
+            from worldquant.models import AlphaResult
+            from worldquant.registry.adapter import record_completed
+            import json
+
+            decay8 = next(s for s in sweep_specs if s.settings["decay"] == 8)
+            record_completed(
+                registry,
+                AlphaResult(
+                    alpha_id="local-B8",
+                    expression=decay8.expression,
+                    dedup_key=experiment_identity(decay8.expression, decay8.settings),
+                    settings_json=json.dumps(decay8.settings),
+                    status=SimulationStatus.COMPLETED,
+                    remote_alpha_id="BRA-B8",
+                    grade="GOOD", passed=True,
+                    sharpe=1.5, fitness=1.2,
+                    submission_checks={
+                        name: {"result": "PASS"} for name in SUBMISSION_CHECKS
+                    },
+                    self_correlation=0.2,
+                ),
+            )
+            repeat = gate_specs(registry, [decay8])
+            assert repeat.kept == []
+            assert repeat.tally.get("REJECT_EXACT_DUPLICATE") == 1
+            forced = gate_specs(registry, [decay8], force=True)
+            assert len(forced.kept) == 1
+        finally:
+            registry.close()

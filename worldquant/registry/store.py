@@ -938,8 +938,12 @@ class FactorRegistry:
     ) -> dict[str, Any]:
         """One-call adapter hook: metrics -> metric reject -> correlation gate.
 
-        Returns ``{"factor_id", "status", "correlation_decision"}``. Never
-        raises: registry bookkeeping must not break a backtest run.
+        Returns ``{"factor_id", "status", "corr_status",
+        "correlation_decision"}`` (an extra ``"error"`` key is added on the
+        swallowed-exception path). ``corr_status`` is the persisted verdict:
+        PASS/FAIL/UNKNOWN when the gate is enabled, NOT_APPLICABLE when the
+        gate is disabled by config. Never raises: registry bookkeeping must
+        not break a backtest run.
         """
         try:
             factor_id = self.save_simulation_result(result)
@@ -951,6 +955,7 @@ class FactorRegistry:
                 records = list(corr_records or [])
                 max_self = getattr(result, "self_correlation", None)
                 if records:
+                    # Edges feed the graph even when the gate itself is off.
                     self.save_correlations(factor_id, records, CORR_TYPE_SELF)
                 elif max_self is not None:
                     self.save_correlations(
@@ -958,23 +963,42 @@ class FactorRegistry:
                         [{"correlation": max_self, "other_brain_alpha_id": None}],
                         CORR_TYPE_SELF_MAX,
                     )
-                if apply_gate and self.config.correlation.enabled and (records or max_self is not None):
+                if not apply_gate:
+                    pass
+                elif self.config.correlation.enabled and (records or max_self is not None):
                     decision = self.apply_correlation_gate(factor_id)
-                elif apply_gate and self.config.correlation.enabled:
+                elif self.config.correlation.enabled:
                     # Metric-passed but no correlation evidence at all: record
                     # UNKNOWN explicitly (factor stays SIMULATED, never PASSED).
                     self._execute(
-                        "UPDATE factors SET corr_status = ? WHERE id = ?",
+                        "UPDATE factors SET corr_status = ?, corr_band = NULL, "
+                        "corr_margin = NULL WHERE id = ?",
                         (CorrelationStatus.UNKNOWN.value, factor_id),
                     )
+                else:
+                    # Local correlation gate disabled by config. This is NOT
+                    # UNKNOWN: there is no pending evidence to wait for, so a
+                    # metric-passed factor is promoted to PASSED and its corr
+                    # verdict is recorded as NOT_APPLICABLE. BRAIN's official
+                    # submission checks live separately on the metrics row.
+                    # No corr-pass counter bump: the gate itself never ran.
+                    self.set_status(factor_id, FactorStatus.PASSED)
+                    self._execute(
+                        "UPDATE factors SET corr_status = ?, corr_band = NULL, "
+                        "corr_margin = NULL, failure_category = NULL WHERE id = ?",
+                        (CorrelationStatus.NOT_APPLICABLE.value, factor_id),
+                    )
+            final = self.get_factor(factor_id)
             return {
                 "factor_id": factor_id,
-                "status": self.get_factor(factor_id)["status"],
+                "status": final["status"],
+                "corr_status": final["corr_status"],
                 "correlation_decision": decision,
             }
         except Exception as exc:  # noqa: BLE001 - isolation boundary
             self.log.warning("registry.handle_completed failed: %s", exc)
-            return {"factor_id": None, "status": None, "correlation_decision": None,
+            return {"factor_id": None, "status": None, "corr_status": None,
+                    "correlation_decision": None,
                     "error": str(exc)}
 
     # ------------------------------------------------------------------ #
@@ -1366,6 +1390,15 @@ class FactorRegistry:
     def find_exact(self, expression: str, settings: dict[str, Any] | None = None) -> dict[str, Any] | None:
         exact = dedup_key(expression, normalize_settings(settings))
         rows = self._query("SELECT * FROM factors WHERE exact_hash = ?", (exact,))
+        return dict(rows[0]) if rows else None
+
+    def get_factor_by_brain_alpha_id(self, alpha_id: str | None) -> dict[str, Any] | None:
+        """Full factor row for a BRAIN alpha id, or None (read-only lookup)."""
+        if not alpha_id:
+            return None
+        rows = self._query(
+            "SELECT * FROM factors WHERE brain_alpha_id = ?", (str(alpha_id),)
+        )
         return dict(rows[0]) if rows else None
 
     # ------------------------------------------------------------------ #

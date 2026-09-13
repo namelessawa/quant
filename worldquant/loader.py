@@ -4,8 +4,11 @@ Supported inputs:
     * ``.txt`` — one expression per line; blank lines and full-line ``#`` or
       ``//`` comments ignored. Inline comments are deliberately NOT stripped:
       guessing where a comment starts could silently corrupt an expression.
-    * ``.csv`` — ``name,expression`` plus optional per-row settings columns
-    * ``.json`` — a list of expressions, or a list of ``{name, expression}`` maps
+    * ``.csv`` — ``name,expression`` plus optional per-row settings columns and
+      optional ablation provenance columns (``source`` / ``ablation_group_id`` /
+      ``changed_parameters`` / ``parent_experiment_id``)
+    * ``.json`` — a list of expressions, or a list of ``{name, expression}``
+      maps (the same settings/ablation keys are supported)
 
 Rows are de-duplicated on ``expression + settings`` at load time, so a repeated
 line in the input file cannot cause a second submission.
@@ -26,6 +29,12 @@ from .models import AlphaSpec
 
 _EXPRESSION_COLUMNS = ("expression", "code", "formula", "expr", "regular", "alpha")
 _NAME_COLUMNS = ("name", "id", "alpha_id", "label")
+#: Optional ablation provenance columns (CSV) / keys (JSON). Absent for normal
+#: alpha inputs; see ``AlphaSpec`` for their semantics.
+_SOURCE_COLUMN = "source"
+_ABLATION_GROUP_COLUMNS = ("ablation_group_id", "ablation_group")
+_PARENT_COLUMNS = ("parent_experiment_id", "parent_id")
+_CHANGED_COLUMNS = ("changed_parameters", "changed_params", "ablation_changes")
 #: CSV columns that override the global backtest settings for one row.
 _SETTING_COLUMNS = frozenset(DEFAULT_SETTINGS) | {
     "instrument_type", "unit_handling", "nan_handling",
@@ -63,6 +72,88 @@ def _row_settings(row: dict[str, Any]) -> dict[str, Any]:
     return overrides
 
 
+def _raw_pick(row: dict[str, Any], candidates: Iterable[str]) -> Any:
+    """Like :func:`_pick` but keeps non-string values (JSON dicts) intact."""
+    for key in candidates:
+        value = row.get(key)
+        if value is None:
+            lowered = {str(k).strip().lower(): v for k, v in row.items()}
+            value = lowered.get(key.lower())
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            return value
+    return None
+
+
+def _coerce_scalar(text: str) -> Any:
+    """Parse one ``changed_parameters`` value (numbers/bools stay typed)."""
+    token = text.strip()
+    if token == "":
+        return ""
+    lowered = token.lower()
+    if lowered in {"true", "yes", "on"}:
+        return True
+    if lowered in {"false", "no", "off"}:
+        return False
+    try:
+        number = float(token)
+    except ValueError:
+        return token
+    return int(number) if number.is_integer() else number
+
+
+def _parse_changed_parameters(raw: Any) -> dict[str, Any] | None:
+    """Accept a JSON object or ``key=value;key=value`` text; None when empty."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return dict(raw)
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return dict(parsed)
+    changes: dict[str, Any] = {}
+    for piece in text.replace("\n", ";").split(";"):
+        if not piece.strip() or "=" not in piece:
+            continue
+        key, _, value = piece.partition("=")
+        key = key.strip()
+        if key:
+            changes[key] = _coerce_scalar(value)
+    return changes or None
+
+
+def _ablation_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    """Extract optional ablation provenance fields from a CSV/JSON row.
+
+    Returns keyword arguments for ``AlphaSpec`` (omitted when not supplied).
+    """
+    meta: dict[str, Any] = {}
+    source = _pick(row, [_SOURCE_COLUMN])
+    if source:
+        meta["source"] = source
+    group = _pick(row, _ABLATION_GROUP_COLUMNS)
+    if group:
+        meta["ablation_group_id"] = group
+    changed_raw = _raw_pick(row, _CHANGED_COLUMNS)
+    changes = _parse_changed_parameters(changed_raw)
+    if changes:
+        meta["changed_parameters"] = changes
+    parent_raw = _raw_pick(row, _PARENT_COLUMNS)
+    if parent_raw:
+        try:
+            meta["parent_experiment_id"] = int(float(parent_raw))
+        except ValueError:
+            raise ConfigError(
+                f"parent_experiment_id must be an integer, got {parent_raw!r}"
+            ) from None
+    return meta
+
+
 def _from_csv(path: Path) -> list[AlphaSpec]:
     # utf-8-sig strips the BOM Excel writes on Windows.
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -92,7 +183,12 @@ def _from_csv(path: Path) -> list[AlphaSpec]:
             expression = str(expression).strip()
             name = _pick(cleaned, _NAME_COLUMNS)
             specs.append(
-                AlphaSpec(expression=expression, name=name, settings=_row_settings(cleaned))
+                AlphaSpec(
+                    expression=expression,
+                    name=name,
+                    settings=_row_settings(cleaned),
+                    **_ablation_metadata(cleaned),
+                )
             )
         if not specs:
             raise ConfigError(f"{path} contained no usable alpha rows")
@@ -137,6 +233,7 @@ def _from_json(path: Path) -> list[AlphaSpec]:
                     expression=expression,
                     name=_pick(item, _NAME_COLUMNS),
                     settings=dict(settings) if isinstance(settings, dict) else {},
+                    **_ablation_metadata(item),
                 )
             )
         else:

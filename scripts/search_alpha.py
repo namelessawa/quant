@@ -218,6 +218,22 @@ def parse_setting_overrides(pairs: list[str]) -> dict[str, object]:
     return overrides
 
 
+def tag_ablation_specs(specs: list[AlphaSpec], group_id: str) -> int:
+    """Mark specs as an explicit ablation sweep in-place.
+
+    Rows that already carry ``source`` metadata (e.g. a CSV with mixed normal
+    and ablation rows) are left untouched. Returns how many were tagged.
+    """
+    tagged = 0
+    for spec in specs:
+        if getattr(spec, "source", None):
+            continue
+        spec.source = "ablation"
+        spec.ablation_group_id = group_id
+        tagged += 1
+    return tagged
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="search_alpha.py",
@@ -260,6 +276,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="also accept a matching grade already stored from an earlier run",
     )
     parser.add_argument(
+        "--ablation-group", metavar="ID",
+        help="tag every loaded candidate as an explicit ablation-sweep variant "
+             "sharing group ID. Ablations bypass same-signal capacity/scope "
+             "de-dup but exact experiment duplicates are still blocked; full "
+             "per-row provenance (changed_parameters/parent_experiment_id) "
+             "comes from the CSV/JSON input columns",
+    )
+    parser.add_argument(
         "--no-registry", action="store_true",
         help="disable the factor registry (memory/duplicate/novelty gate) for this run",
     )
@@ -290,8 +314,91 @@ def is_acceptable_hit(result: AlphaResult, target: str) -> bool:
     alone, so GOOD-graded alphas carrying two or three failing checks have been
     observed live. An alpha that cannot be submitted is not a find, and an alpha
     whose checks were never resolved is not a find either.
+
+    NOTE: this covers the BRAIN half only. Callers that hold a Factor Registry
+    must additionally run :func:`evaluate_acceptance`, since a stored value like
+    0.68 passes the official 0.70 check yet fails the local research threshold.
     """
     return grade_meets_target(result.grade, target) and result.is_submittable
+
+
+def historical_research_outcome(registry: Any, result: AlphaResult) -> dict[str, Any]:
+    """Build a research-gate outcome for a stored historical alpha.
+
+    Prefer the existing factor row (pure read). When the alpha predates the
+    registry and has no row, fold it into research memory locally via
+    :func:`record_results` — this writes no simulation and spends no BRAIN
+    quota; it only persists SELF_MAX/edges and runs the same gate a fresh
+    simulation would get.
+    """
+    row = registry.get_factor_by_brain_alpha_id(
+        getattr(result, "remote_alpha_id", None)
+    )
+    if row is not None:
+        return {
+            "factor_id": row.get("id"),
+            "status": row.get("status"),
+            "corr_status": row.get("corr_status"),
+            "correlation_decision": None,
+        }
+    return record_results(registry, [result])[0][1] or {}
+
+
+def evaluate_historical_candidates(
+    registry: Any,
+    candidates: list[AlphaResult],
+    *,
+    log: Any,
+) -> list[tuple[AlphaResult, Any]]:
+    """Run the unified acceptance rule over --include-existing candidates.
+
+    Historical alphas are NOT accepted on ``is_submittable`` alone: they face
+    the same research correlation gate as freshly simulated ones. Returns the
+    ``(result, AcceptanceDecision)`` pairs that pass and logs why the rest fail.
+    """
+    corr_cfg = registry.config.correlation if registry is not None else None
+    # --no-registry: no local verdict exists, so the BRAIN checks alone decide
+    # (identical to the live simulation path). With a registry, UNKNOWN rejects
+    # unless the operator explicitly allows it in config.
+    allow_unknown = (
+        registry is None
+        or bool(getattr(corr_cfg, "allow_submit_without_corr", False))
+    )
+    accepted: list[tuple[AlphaResult, Any]] = []
+    blocked: dict[str, int] = {}
+    for result in candidates:
+        outcome = (
+            historical_research_outcome(registry, result)
+            if registry is not None else None
+        )
+        decision = evaluate_acceptance(
+            result,
+            outcome,
+            grade_ok=True,
+            allow_unknown=allow_unknown,
+            corr_config=corr_cfg,
+        )
+        if decision.accepted:
+            accepted.append((result, decision))
+            continue
+        key = decision.research_corr_status or "NO_RESEARCH_VERDICT"
+        blocked[key] = blocked.get(key, 0) + 1
+        log.info(
+            "  stored alpha %s excluded from --include-existing: %s",
+            result.remote_alpha_id or result.alpha_id,
+            decision.reason,
+        )
+        log.info(
+            "  %s",
+            describe_corr_verdicts(result, outcome, corr_config=corr_cfg),
+        )
+    if blocked:
+        log.info(
+            "%d stored submittable alpha(s) rejected by the local research "
+            "gate: %s",
+            sum(blocked.values()), dict(blocked),
+        )
+    return accepted
 
 
 def describe_submission(result: AlphaResult) -> str:
@@ -418,6 +525,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.max_attempts >= 0:
         specs = specs[: args.max_attempts]
+    if args.ablation_group:
+        tagged = tag_ablation_specs(specs, args.ablation_group)
+        log.info(
+            "Tagged %d candidate(s) as ablation sweep %r",
+            tagged, args.ablation_group,
+        )
     if not specs:
         if args.max_attempts <= 0:
             log.error("--max-attempts is %d, so there is nothing to simulate", args.max_attempts)
@@ -482,18 +595,30 @@ def main(argv: list[str] | None = None) -> int:
                     len(graded), target, len(graded) - len(candidates),
                 )
             if candidates:
-                # Rank first, then fitness: several alphas can share the top
-                # grade, and the strongest one is the useful answer.
-                best = max(
-                    candidates,
-                    key=lambda r: (AlphaGrade.rank(r.grade), r.fitness or float("-inf")),
+                # The OTHER half: historical alphas must clear the same unified
+                # research gate a fresh simulation faces. A 0.68 (passes BRAIN
+                # 0.70, fails research 0.65) and an UNKNOWN verdict are not
+                # hits. With correlation.enabled=false the verdict is
+                # NOT_APPLICABLE and the official checks alone decide.
+                accepted = evaluate_historical_candidates(
+                    registry, candidates, log=log
                 )
-                log.info(
-                    "Found %d verified alpha(s) graded %s or better; best is %s",
-                    len(candidates), target, best.grade,
-                )
-                report_hit(best, log, attempts=0)
-                return EXIT_FOUND
+                if accepted:
+                    # Rank first, then fitness: several alphas can share the
+                    # top grade, and the strongest one is the useful answer.
+                    best = max(
+                        (result for result, _ in accepted),
+                        key=lambda r: (
+                            AlphaGrade.rank(r.grade), r.fitness or float("-inf")
+                        ),
+                    )
+                    log.info(
+                        "Found %d verified alpha(s) graded %s or better that "
+                        "clear the research gate; best is %s",
+                        len(accepted), target, best.grade,
+                    )
+                    report_hit(best, log, attempts=0)
+                    return EXIT_FOUND
 
         # The Registry research gate runs FIRST, before the ResultStore
         # execution-dedup: every candidate must be visible to research memory
@@ -524,9 +649,21 @@ def main(argv: list[str] | None = None) -> int:
         already_run = store.simulated_scope_hashes()
         if already_run:
             before = len(specs)
+
+            def _scope_dedup_exempt(spec: AlphaSpec) -> bool:
+                # Explicit ablation sweeps deliberately re-run the SAME signal
+                # (region/universe/delay) under different decay/truncation/
+                # neutralization. The scope filter would silently drop them
+                # here; exact experiment duplicates are still caught later by
+                # the Registry gate (REJECT_EXACT) and runner dedup.
+                return bool(getattr(spec, "source", None) == "ablation") or bool(
+                    getattr(spec, "force_gate", False)
+                )
+
             specs = [
                 spec for spec in specs
-                if scope_hash(spec.expression, spec.settings) not in already_run
+                if _scope_dedup_exempt(spec)
+                or scope_hash(spec.expression, spec.settings) not in already_run
             ]
             dropped = before - len(specs)
             if dropped:

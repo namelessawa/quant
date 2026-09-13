@@ -205,6 +205,9 @@ def _do_not_repeat(
                 "reason": "saturated cluster: high internal self-correlation",
                 "trials": cluster["size"],
                 "best_corr": cluster.get("max_corr"),
+                "mean_abs_corr": cluster.get("mean_abs_corr"),
+                "known_pair_coverage": cluster.get("known_pair_coverage"),
+                "high_corr_density": cluster.get("high_corr_density"),
                 "kind": "cluster",
             }
         )

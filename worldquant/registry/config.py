@@ -129,7 +129,22 @@ class SimilarityConfig:
 @dataclass(frozen=True)
 class ClusteringConfig:
     enabled: bool = True
+    #: Edge cutoff used ONLY to build the connected-component graph.
     corr_threshold: float = 0.70
+    #: Saturation is decided from unbiased whole-cluster statistics rather than
+    #: from the graph edges (every one of which is above ``corr_threshold`` by
+    #: construction, so averaging only them inflates internal similarity).
+    saturated_min_size: int = 3
+    #: Fraction of all member pairs that must have an observed pairwise SELF
+    #: correlation. Unobserved pairs are evidence gaps, never zero corr.
+    saturated_min_coverage: float = 0.60
+    #: Saturated when the mean |corr| over all OBSERVED member pairs is at/above
+    #: this, OR when high_corr_density (below) clears its cutoff.
+    saturated_mean_abs_corr: float = 0.65
+    #: Fraction of ALL member pairs (not just observed ones) observed at/above
+    #: the graph cutoff. A long 0.71-chain with weak end-to-end links stays
+    #: below this and is not marked saturated.
+    saturated_high_corr_density: float = 0.70
 
 
 @dataclass(frozen=True)
@@ -178,7 +193,9 @@ class MemoryConfig:
     same_signal_novelty_factor: float = 0.35
     #: Index prefilter pool size before expensive Python-side comparison.
     neighbor_pool_limit: int = 500
-    #: A multi-factor cluster at/above this size AND internal corr is saturated.
+    #: Deprecated: cluster saturation thresholds moved to ClusteringConfig
+    #: (unbiased mean_abs_corr / coverage / density rule). Retained so existing
+    #: config files keep parsing; no longer read by the clustering code.
     cluster_saturated_min_size: int = 3
     cluster_saturated_avg_corr: float = 0.70
     #: Datasets/families with <=N trials appear in the underexplored sections.
@@ -295,6 +312,16 @@ def build_registry_config(
             "factor_registry.clustering.corr_threshold must be within [0, 1], got "
             f"{config.clustering.corr_threshold}"
         )
+    if config.clustering.saturated_min_size < 2:
+        raise ConfigError(
+            "factor_registry.clustering.saturated_min_size must be >= 2"
+        )
+    for name in (
+        "saturated_min_coverage",
+        "saturated_mean_abs_corr",
+        "saturated_high_corr_density",
+    ):
+        _within_01(name, getattr(config.clustering, name))
     if config.pre_simulation.min_novelty < 0:
         raise ConfigError("factor_registry.pre_simulation.min_novelty cannot be negative")
     if config.pre_simulation.max_template_trials < 1:

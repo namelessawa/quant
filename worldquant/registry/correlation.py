@@ -17,11 +17,14 @@ Only correlations against the *protected set* (SUBMITTED alphas, PASSED
 candidates, and unresolved BRAIN neighbors, which are always live account
 alphas) are evaluated. Research-set rows feed de-dup/novelty instead.
 
-The verdict is three-valued: ``PASS`` / ``FAIL`` / ``UNKNOWN``. Missing,
-pending, timed-out or unparsable records produce ``UNKNOWN`` — never a
-vacuous pass — so an alpha with no evidence cannot be promoted automatically;
+The verdict is four-valued: ``PASS`` / ``FAIL`` / ``UNKNOWN`` /
+``NOT_APPLICABLE``. Missing, pending, timed-out or unparsable records produce
+``UNKNOWN`` — never a vacuous pass — so an alpha with no evidence cannot be
+promoted automatically; ``NOT_APPLICABLE`` means the local gate is disabled in
+config (``correlation.enabled=false``), so no local verdict is required and
+acceptance falls back to BRAIN's official checks.
 ``allow_submit_without_corr`` (default false) governs whether manual override
-is permitted.
+is permitted for UNKNOWN.
 """
 
 from __future__ import annotations
@@ -38,6 +41,11 @@ class CorrelationStatus(str, Enum):
     FAIL = "FAIL"
     #: No usable evidence (empty / pending / timeout / malformed records).
     UNKNOWN = "UNKNOWN"
+    #: The local research gate is switched off by config
+    #: (``correlation.enabled=false``). This is deliberately distinct from
+    #: UNKNOWN: nothing is pending and nothing is missing — acceptance simply
+    #: falls back to BRAIN's official submission checks.
+    NOT_APPLICABLE = "NOT_APPLICABLE"
 
 
 class CorrelationBand(str, Enum):
@@ -49,6 +57,8 @@ class CorrelationBand(str, Enum):
     RESEARCH_REJECT = "RESEARCH_REJECT"
     #: No usable evidence.
     UNKNOWN = "UNKNOWN"
+    #: Local research correlation gate disabled.
+    NOT_APPLICABLE = "NOT_APPLICABLE"
 
 
 @dataclass(frozen=True)

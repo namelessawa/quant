@@ -269,22 +269,38 @@ def cmd_clusters(registry, config, args, log) -> int:
         return EXIT_OK
     header = (
         f"{'cluster':>7} {'size':>4} {'representative':>14} "
-        f"{'submitted':>9} {'avg_corr':>8} {'max_corr':>8} "
-        f"{'saturated':>9}  theme"
+        f"{'submitted':>9} {'avg_corr':>8} {'mean|r|':>8} {'cov':>5} "
+        f"{'dens':>5} {'max_corr':>8} {'saturated':>9}  theme"
     )
     print(header)
     print("-" * len(header))
     for cluster in clusters:
         avg = f"{cluster.avg_corr:.3f}" if cluster.avg_corr is not None else "n/a"
+        mean = (
+            f"{cluster.mean_abs_corr:.3f}"
+            if cluster.mean_abs_corr is not None else "n/a"
+        )
+        cov = (
+            f"{cluster.known_pair_coverage:.2f}"
+            if cluster.known_pair_coverage is not None else "n/a"
+        )
+        dens = (
+            f"{cluster.high_corr_density:.2f}"
+            if cluster.high_corr_density is not None else "n/a"
+        )
         mx = f"{cluster.max_corr:.3f}" if cluster.max_corr is not None else "n/a"
         print(
             f"{cluster.cluster_id:>7} {cluster.size:>4} "
             f"{cluster.representative_id:>14} {cluster.submitted_count:>9} "
-            f"{avg:>8} {mx:>8} {str(cluster.saturated):>9}  "
-            f"{cluster.theme or ''}"
+            f"{avg:>8} {mean:>8} {cov:>5} {dens:>5} {mx:>8} "
+            f"{str(cluster.saturated):>9}  {cluster.theme or ''}"
         )
-    print(f"\n{len(clusters)} cluster(s); edges are pairwise SELF rows only "
-          f"(SELF_MAX aggregates never enter the graph).")
+    print(
+        f"\n{len(clusters)} cluster(s); edges are pairwise SELF rows only "
+        "(SELF_MAX aggregates never enter the graph). avg_corr averages graph "
+        "edges (>= cutoff) for compatibility; mean|r| averages ALL observed "
+        "member pairs, cov=known pairs/all pairs, dens=high-corr pairs/all pairs."
+    )
     return EXIT_OK
 
 
@@ -691,23 +707,36 @@ def build_markdown_report(registry) -> str:
         lines.append("- _none_")
     lines.append("")
     saturated_clusters = ctx["saturated_clusters"]
+    cluster_cfg = registry.config.clustering
     lines.append(
         f"### Saturated clusters: {len(saturated_clusters)} "
-                "(min size 3, avg internal corr >= 0.70)"
+        f"(min size {cluster_cfg.saturated_min_size}, coverage >= "
+        f"{cluster_cfg.saturated_min_coverage:.2f}, mean |corr| >= "
+        f"{cluster_cfg.saturated_mean_abs_corr:.2f} OR high-corr density >= "
+        f"{cluster_cfg.saturated_high_corr_density:.2f})"
     )
     if saturated_clusters:
         lines.append("")
-        lines.append("| Rep | Size | Avg corr | Max corr | Best sharpe | Theme | Families |")
-        lines.append("| ---: | ---: | ---: | ---: | ---: | --- | --- |")
+        lines.append(
+            "| Rep | Size | Avg corr (edges) | Mean abs corr | Coverage | "
+            "High density | Max corr | Best sharpe | Theme | Families |"
+        )
+        lines.append(
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |"
+        )
         for cluster in saturated_clusters[:15]:
             families = ", ".join(
                 list((cluster.get("family_distribution") or {}).keys())[:3]
             )
             lines.append(
                 f"| {cluster['representative_id']} | {cluster['size']} | "
-                f"{_fmt(cluster.get('avg_corr'))} | {_fmt(cluster.get('max_corr'))} | "
-                f"{_fmt(cluster.get('best_sharpe'))} | {cluster.get('theme') or '?'} | "
-                f"{families} |"
+                f"{_fmt(cluster.get('avg_corr'), 3)} | "
+                f"{_fmt(cluster.get('mean_abs_corr'), 3)} | "
+                f"{_fmt(cluster.get('known_pair_coverage'), 3)} | "
+                f"{_fmt(cluster.get('high_corr_density'), 3)} | "
+                f"{_fmt(cluster.get('max_corr'), 3)} | "
+                f"{_fmt(cluster.get('best_sharpe'))} | "
+                f"{cluster.get('theme') or '?'} | {families} |"
             )
     else:
         lines.append("- _none_")

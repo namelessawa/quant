@@ -304,6 +304,94 @@ class TestResearchCorrelationCutoff:
         assert decision.accepted is False
         assert "grade" in decision.reason
 
+    def test_disabled_gate_is_not_applicable_and_accepts_on_brain_checks(self, tmp_path):
+        # correlation.enabled=false ⇒ NOT_APPLICABLE, never UNKNOWN: a
+        # submittable metric-pass is accepted on BRAIN checks alone without
+        # allow_unknown, and gets persisted PASSED/NOT_APPLICABLE.
+        cfg = replace(
+            RegistryConfig(),
+            correlation=replace(RegistryConfig().correlation, enabled=False),
+        )
+        reg = FactorRegistry(tmp_path / "fr-off.db", cfg)
+        try:
+            result = make_result(EXPR, self_corr=0.68, alpha_id="BRA-OFF")
+            outcome = record_results(reg, [result])[0][1]
+            assert outcome["status"] == FactorStatus.PASSED
+            assert outcome["corr_status"] == "NOT_APPLICABLE"
+            decision = evaluate_acceptance(
+                result, outcome, grade_ok=True, corr_config=cfg.correlation
+            )
+            assert decision.research_corr_status == "NOT_APPLICABLE"
+            assert decision.accepted is True
+            line = describe_corr_verdicts(
+                result, outcome, corr_config=cfg.correlation
+            )
+            assert "NOT_APPLICABLE" in line
+        finally:
+            reg.close()
+
+    def test_disabled_gate_still_refuses_when_brain_checks_fail(self, tmp_path):
+        cfg = replace(
+            RegistryConfig(),
+            correlation=replace(RegistryConfig().correlation, enabled=False),
+        )
+        reg = FactorRegistry(tmp_path / "fr-off2.db", cfg)
+        try:
+            result = make_result(EXPR, self_corr=0.68, checks=passing_checks())
+            outcome = record_results(reg, [result])[0][1]
+            # Pretend the official checks do not pass: NOT_APPLICABLE must not
+            # rescue an alpha BRAIN itself rejects.
+            result.submission_checks["SELF_CORRELATION"] = {"result": "FAIL"}
+            decision = evaluate_acceptance(
+                result, outcome, grade_ok=True, corr_config=cfg.correlation
+            )
+            assert decision.accepted is False
+            assert "BRAIN submission checks" in decision.reason
+        finally:
+            reg.close()
+
+    def test_stored_failure_remains_a_failure_when_gate_is_disabled(self, tmp_path):
+        # A historical FAIL verdict is real evidence: flipping the gate off
+        # must not retroactively turn it into NOT_APPLICABLE.
+        cfg = replace(
+            RegistryConfig(),
+            correlation=replace(RegistryConfig().correlation, enabled=False),
+        )
+        reg = FactorRegistry(tmp_path / "fr-off3.db", cfg)
+        try:
+            result = make_result(EXPR, self_corr=0.68, alpha_id="BRA-H")
+            outcome = {
+                "factor_id": 1,
+                "status": FactorStatus.CORR_REJECTED,
+                "corr_status": "FAIL",
+                "correlation_decision": None,
+            }
+            decision = evaluate_acceptance(
+                result, outcome, grade_ok=True, corr_config=cfg.correlation
+            )
+            assert decision.research_corr_status == "FAIL"
+            assert decision.accepted is False
+        finally:
+            reg.close()
+
+    def test_unknown_status_is_preserved_only_for_missing_evidence(self):
+        # UNKNOWN means "check needed, evidence not yet obtained" — it must be
+        # distinct from the disabled NOT_APPLICABLE state.
+        result = make_result(EXPR, self_corr=None)
+        outcome = {
+            "factor_id": 1,
+            "status": FactorStatus.SIMULATED,
+            "corr_status": "UNKNOWN",
+            "correlation_decision": None,
+        }
+        decision = evaluate_acceptance(
+            result, outcome, grade_ok=True,
+            corr_config=RegistryConfig().correlation,
+        )
+        assert decision.research_corr_status == "UNKNOWN"
+        assert decision.accepted is False
+        assert "UNKNOWN" in decision.reason
+
 
 # --------------------------------------------------------------------------- #
 # Spec 33: ablation sweeps
@@ -479,3 +567,73 @@ class TestCorrelationClusters:
         )
         clusters = get_clusters(registry, threshold=0.70, min_size=1)
         assert all(cluster.size == 1 for cluster in clusters)
+
+    def test_chain_with_weak_end_to_end_link_is_not_saturated(self, registry):
+        # A-B=0.71, B-C=0.71 merge all three into one graph cluster, but the
+        # observed A-C=0.20 weak link must keep unbiased cluster stats honest:
+        # mean |corr| over ALL observed pairs is 0.54, not the graph-edge-only
+        # 0.71 average; density is 2/3; neither clears the saturation rule.
+        a = self._seed_factor(registry, "BRA-A", "rank(close)")
+        b = self._seed_factor(registry, "BRA-B", "rank(open)")
+        c = self._seed_factor(registry, "BRA-C", "rank(high)")
+        registry.save_correlations(
+            a, [{"alpha_id": "BRA-B", "correlation": 0.71}], CORR_TYPE_SELF
+        )
+        registry.save_correlations(
+            b, [{"alpha_id": "BRA-C", "correlation": 0.71}], CORR_TYPE_SELF
+        )
+        registry.save_correlations(
+            a, [{"alpha_id": "BRA-C", "correlation": 0.20}], CORR_TYPE_SELF
+        )
+
+        clusters = get_clusters(registry, threshold=0.70, min_size=1)
+        big = max(clusters, key=lambda cluster: cluster.size)
+        assert set(big.factor_ids) == {a, b, c}
+
+        # Legacy graph-edge statistic stays >= cutoff (kept for compatibility).
+        assert big.avg_corr is not None
+        assert big.avg_corr == pytest.approx(0.71, abs=1e-9)
+        # The unbiased statistics must not repeat that bias.
+        assert big.mean_abs_corr == pytest.approx(
+            (0.71 + 0.71 + 0.20) / 3.0, abs=1e-9
+        )
+        assert big.total_pair_count == 3
+        assert big.known_pair_count == 3
+        assert big.known_pair_coverage == pytest.approx(1.0)
+        assert big.high_corr_density == pytest.approx(2.0 / 3.0)
+        assert big.max_corr == pytest.approx(0.71)
+        assert big.saturated is False
+        payload = big.to_dict()
+        assert payload["mean_abs_corr"] == big.mean_abs_corr
+        assert payload["known_pair_coverage"] == big.known_pair_coverage
+        assert payload["high_corr_density"] == big.high_corr_density
+
+    def test_unobserved_pairs_lower_coverage_and_density_not_mean(self, registry):
+        # 4 members, only three 0.90 chain links observed, three pairs have no
+        # row at all. They must NOT be treated as zero correlation: mean stays
+        # 0.90 while coverage/density are both 0.5 and the cluster is not
+        # saturated (coverage below the default 0.60 requirement).
+        a = self._seed_factor(registry, "BRA-A", "rank(close)")
+        b = self._seed_factor(registry, "BRA-B", "rank(open)")
+        c = self._seed_factor(registry, "BRA-C", "rank(high)")
+        d = self._seed_factor(registry, "BRA-D", "rank(low)")
+        registry.save_correlations(
+            a, [{"alpha_id": "BRA-B", "correlation": 0.90}], CORR_TYPE_SELF
+        )
+        registry.save_correlations(
+            b, [{"alpha_id": "BRA-C", "correlation": 0.90}], CORR_TYPE_SELF
+        )
+        registry.save_correlations(
+            c, [{"alpha_id": "BRA-D", "correlation": 0.90}], CORR_TYPE_SELF
+        )
+
+        clusters = get_clusters(registry, threshold=0.70, min_size=1)
+        big = max(clusters, key=lambda cluster: cluster.size)
+        assert set(big.factor_ids) == {a, b, c, d}
+        assert big.total_pair_count == 6
+        assert big.known_pair_count == 3
+        assert big.known_pair_coverage == pytest.approx(0.5)
+        assert big.high_corr_density == pytest.approx(0.5)
+        assert big.mean_abs_corr == pytest.approx(0.90)
+        assert big.avg_corr == pytest.approx(0.90)
+        assert big.saturated is False

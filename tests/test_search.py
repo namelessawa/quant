@@ -878,3 +878,188 @@ class TestConcurrencyCap:
             "--concurrency", "1", "--no-yearly",
         ])
         assert seen["min_request_interval"] == 7.5
+
+
+class TestHistoricalAlphasResearchGate:
+    """--include-existing routes stored alphas through evaluate_acceptance.
+
+    A historical alpha that passes BRAIN's official 0.70 check must still
+    clear the Registry's research gate (0.65): corr FAIL and corr UNKNOWN are
+    not hits, while correlation.enabled=false yields NOT_APPLICABLE and the
+    official checks alone decide.
+    """
+
+    def _seed(self, search, *, self_corr, alpha_id="OLD1", expression="rank(stored)"):
+        from worldquant.hashing import dedup_key
+        from worldquant.models import AlphaResult
+
+        db_path = search["tmp_path"] / "search.db"
+        settings = {"region": "USA", "delay": 1}
+        with ResultStore(db_path) as store:
+            alpha_row = store.upsert_alpha(expression, settings, name="stored")
+            sim_row = store.create_simulation(alpha_row, remote_simulation_id="sim_old")
+            store.update_simulation(
+                sim_row, status=SimulationStatus.COMPLETED,
+                remote_alpha_id=alpha_id, mark_completed=True,
+            )
+            store.save_result(sim_row, AlphaResult(
+                alpha_id="stored", expression=expression,
+                dedup_key=dedup_key(expression, settings),
+                status=SimulationStatus.COMPLETED, remote_alpha_id=alpha_id,
+                sharpe=2.2, fitness=1.6, grade="GOOD",
+                long_count=1500, short_count=1400, passed=True,
+                submission_checks=all_pass_checks(),
+                self_correlation=self_corr,
+            ))
+        return db_path
+
+    def _registry_config(self, search, *, corr_enabled=True):
+        cfg = search["tmp_path"] / "registry.yaml"
+        lines = ["factor_registry:", "  enabled: true",
+                 "  db_path: factor_registry.db"]
+        if not corr_enabled:
+            lines += ["  correlation:", "    enabled: false"]
+        cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return cfg
+
+    def _other_candidates(self, search, expression="rank(ts_delta(volume, 5))"):
+        path = search["tmp_path"] / "candidates.txt"
+        path.write_text(expression + "\n", encoding="utf-8")
+        return path
+
+    def _log(self, search):
+        return (search["tmp_path"] / "search.log").read_text(encoding="utf-8")
+
+    def test_068_historical_alpha_is_not_a_hit(self, search):
+        db_path = self._seed(search, self_corr=0.68, alpha_id="OLD68")
+        cfg = self._registry_config(search)
+        candidates = self._other_candidates(search)
+        backend = grades_in_order("INFERIOR")
+        code = search["run"](
+            "--target-grade", "GOOD", "--include-existing",
+            "--config", str(cfg), "--input", str(candidates),
+            "--max-attempts", "1", backend=backend,
+        )
+        assert code == search_alpha.EXIT_NOT_FOUND
+        # The stored alpha did not short-circuit: one fresh simulation ran.
+        assert backend.submissions == 1
+        logged = self._log(search)
+        assert "rejected by the local research gate" in logged
+        assert "research correlation FAIL" in logged
+
+    def test_unknown_corr_historical_alpha_is_not_a_hit(self, search):
+        # Official checks all PASS (that is why it is submittable), but no local
+        # correlation evidence exists at all -> UNKNOWN -> not a hit.
+        db_path = self._seed(search, self_corr=None, alpha_id="OLDUNK")
+        cfg = self._registry_config(search)
+        candidates = self._other_candidates(search)
+        backend = grades_in_order("INFERIOR")
+        code = search["run"](
+            "--target-grade", "GOOD", "--include-existing",
+            "--config", str(cfg), "--input", str(candidates),
+            "--max-attempts", "1", backend=backend,
+        )
+        assert code == search_alpha.EXIT_NOT_FOUND
+        assert backend.submissions == 1
+        logged = self._log(search)
+        assert "research correlation UNKNOWN" in logged
+
+    def test_passing_historical_alpha_short_circuits_with_registry(self, search):
+        db_path = self._seed(search, self_corr=0.31, alpha_id="OLD31")
+        cfg = self._registry_config(search)
+
+        class Exploding:
+            def __call__(self, method, url, kwargs):
+                raise AssertionError("must not simulate when a stored hit clears the gate")
+
+        search["install"](Exploding())
+        code = search_alpha.main([
+            "--target-grade", "GOOD", "--include-existing",
+            "--config", str(cfg), "--max-attempts", "1",
+            "--db", str(db_path),
+            "--log-file", str(search["tmp_path"] / "s2.log"),
+            "--concurrency", "1", "--no-yearly",
+        ])
+        assert code == search_alpha.EXIT_FOUND
+
+    def test_disabled_corr_gate_accepts_historical_alpha(self, search):
+        import sqlite3
+
+        db_path = self._seed(search, self_corr=0.68, alpha_id="OLD68B")
+        cfg = self._registry_config(search, corr_enabled=False)
+
+        class Exploding:
+            def __call__(self, method, url, kwargs):
+                raise AssertionError("no simulation needed when gate is disabled")
+
+        search["install"](Exploding())
+        code = search_alpha.main([
+            "--target-grade", "GOOD", "--include-existing",
+            "--config", str(cfg), "--max-attempts", "1",
+            "--db", str(db_path),
+            "--log-file", str(search["tmp_path"] / "s3.log"),
+            "--concurrency", "1", "--no-yearly",
+        ])
+        assert code == search_alpha.EXIT_FOUND
+        # The folded factor is PASSED with an explicit NOT_APPLICABLE verdict,
+        # not SIMULATED/UNKNOWN.
+        reg_db = search["tmp_path"] / "data" / "factor_registry.db"
+        with sqlite3.connect(reg_db) as conn:
+            row = conn.execute(
+                "SELECT status, corr_status FROM factors "
+                "WHERE brain_alpha_id = ?", ("OLD68B",),
+            ).fetchone()
+        assert row == ("PASSED", "NOT_APPLICABLE")
+
+
+class TestAblationScopeDedup:
+    """Ablation variants survive the scope_hash prefilter; normal rows don't."""
+
+    def test_ablation_variant_bypasses_scope_prefilter(self, search):
+        from worldquant.hashing import dedup_key
+        from worldquant.models import AlphaResult
+
+        expression = "rank(scope_sweep_probe)"
+        db_path = search["tmp_path"] / "search.db"
+        settings = {"region": "USA", "delay": 1}
+        # The signal scope (region/universe/delay) was already simulated once.
+        with ResultStore(db_path) as store:
+            alpha_row = store.upsert_alpha(expression, settings, name="probe")
+            sim_row = store.create_simulation(alpha_row, remote_simulation_id="sim_seed")
+            store.update_simulation(
+                sim_row, status=SimulationStatus.COMPLETED,
+                remote_alpha_id="SCOPE1", mark_completed=True,
+            )
+            store.save_result(sim_row, AlphaResult(
+                alpha_id="probe", expression=expression,
+                dedup_key=dedup_key(expression, settings),
+                status=SimulationStatus.COMPLETED, remote_alpha_id="SCOPE1",
+                grade="INFERIOR", sharpe=0.4, fitness=0.3,
+                submission_checks=all_pass_checks(), self_correlation=0.2,
+            ))
+
+        cfg = search["tmp_path"] / "registry.yaml"
+        cfg.write_text(
+            "factor_registry:\n  enabled: true\n  db_path: factor_registry.db\n",
+            encoding="utf-8",
+        )
+        # Same expression/scope twice: the ablation row (decay=8) must survive
+        # the scope prefilter; the ordinary row (decay=16) must be dropped.
+        candidates = search["tmp_path"] / "sweep.csv"
+        candidates.write_text(
+            "expression,source,ablation_group_id,decay\n"
+            f"{expression},ablation,g1,8\n"
+            f"{expression},,,16\n",
+            encoding="utf-8",
+        )
+        backend = grades_in_order("INFERIOR", "INFERIOR")
+        code = search["run"](
+            "--target-grade", "GOOD",
+            "--config", str(cfg), "--input", str(candidates),
+            "--max-attempts", "5", backend=backend,
+        )
+        assert code == search_alpha.EXIT_NOT_FOUND
+        # Exactly one candidate (the ablation) reached BRAIN.
+        assert backend.submissions == 1
+        logged = (search["tmp_path"] / "search.log").read_text(encoding="utf-8")
+        assert "Skipped 1 candidate" in logged

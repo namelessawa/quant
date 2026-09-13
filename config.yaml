@@ -140,6 +140,9 @@ factor_registry:
     overfit_min_train_sharpe: 1.5
     same_signal_novelty_factor: 0.35
     neighbor_pool_limit: 500
+    # Deprecated: cluster saturation is configured under `clustering:` now.
+    # Kept for backwards compatibility with old config files; ignored by the
+    # current cluster statistics.
     cluster_saturated_min_size: 3
     cluster_saturated_avg_corr: 0.70
     underexplored_dataset_max_trials: 3
@@ -153,9 +156,17 @@ factor_registry:
     combination_weight: 0.10
 
   # Connected-component clustering over stored correlations.
+  # corr_threshold is used ONLY to build the graph edges (|corr| >= value).
+  # Saturation is decided separately from size + pair coverage plus the real
+  # mean |corr| over all observed pairs or the high-corr edge density; pairs
+  # that have never been observed are never counted as zero.
   clustering:
     enabled: true
     corr_threshold: 0.70
+    saturated_min_size: 3          # >= this many members ...
+    saturated_min_coverage: 0.60   # ... with >= this fraction of pairs observed ...
+    saturated_mean_abs_corr: 0.65  # ... and either mean |corr| >= this ...
+    saturated_high_corr_density: 0.70  # ... or >= this fraction of pairs >= corr_threshold
 
   # research_priority = 0.6*quality + 0.4*novelty
   scoring:

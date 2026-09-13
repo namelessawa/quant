@@ -113,6 +113,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable the Factor Registry research-memory gate and recording "
              "(enabled by default); --force also bypasses the registry gate",
     )
+    behaviour.add_argument(
+        "--ablation-group", metavar="ID",
+        help="tag every loaded candidate as an explicit ablation-sweep variant "
+             "sharing group ID: same-signal variants (different "
+             "decay/truncation/neutralization) are allowed to simulate, while "
+             "exact experiment duplicates remain blocked unless --force. "
+             "Per-row provenance comes from CSV/JSON columns "
+             "(source/ablation_group_id/changed_parameters/parent_experiment_id)",
+    )
 
     mode = parser.add_argument_group("modes")
     mode.add_argument(
@@ -367,6 +376,18 @@ def main(argv: list[str] | None = None) -> int:
         except (ConfigError, WorldQuantError) as exc:
             log.error("%s", exc)
             return EXIT_USAGE_ERROR
+        if getattr(args, "ablation_group", None):
+            tagged = 0
+            for spec in specs:
+                if getattr(spec, "source", None):
+                    continue
+                spec.source = "ablation"
+                spec.ablation_group_id = args.ablation_group
+                tagged += 1
+            log.info(
+                "Tagged %d candidate(s) as ablation sweep %r",
+                tagged, args.ablation_group,
+            )
         if not specs:
             log.error(
                 "no alphas to run: pass --input FILE, --expression EXPR, or --resume-only"

@@ -59,9 +59,10 @@ def gate_specs(
 
     Each spec only needs the ``AlphaSpec`` duck-typed attributes
     (``expression`` / ``settings`` and, optionally, ``source`` / ``force_gate``
-    / ``ablation_group_id`` / ``changed_parameters``). When ``registry`` is
-    ``None`` (disabled or failed to open) every spec passes through unchanged,
-    preserving the pre-Registry execution path exactly.
+    / ``ablation_group_id`` / ``changed_parameters`` /
+    ``parent_experiment_id``). When ``registry`` is ``None`` (disabled or
+    failed to open) every spec passes through unchanged, preserving the
+    pre-Registry execution path exactly.
     """
     if registry is None:
         return GateBatchResult(kept=list(specs), tally={})
@@ -78,6 +79,7 @@ def gate_specs(
             force=force or bool(getattr(spec, "force_gate", False)),
             ablation_group_id=getattr(spec, "ablation_group_id", None),
             changed_parameters=getattr(spec, "changed_parameters", None),
+            parent_experiment_id=getattr(spec, "parent_experiment_id", None),
         )
         if decision is None or decision.passed:
             kept.append(spec)
@@ -138,9 +140,15 @@ class AcceptanceDecision:
 def _research_verdict(
     outcome: dict[str, Any] | None,
 ) -> tuple[str | None, CorrelationDecision | None]:
-    """Derive PASS/FAIL/UNKNOWN from a handle_completed outcome."""
+    """Derive PASS/FAIL/UNKNOWN/NOT_APPLICABLE from a handle_completed outcome."""
     if not outcome:
         return None, None
+    # The stored corr_status column is the authoritative verdict marker and
+    # survives even when this call did not re-run the gate (e.g. a historical
+    # alpha re-evaluated via --include-existing).
+    stored_corr = outcome.get("corr_status")
+    if stored_corr == CorrelationStatus.NOT_APPLICABLE.value:
+        return CorrelationStatus.NOT_APPLICABLE.value, None
     decision = outcome.get("correlation_decision")
     if isinstance(decision, CorrelationDecision):
         return decision.status.value, decision
@@ -172,13 +180,25 @@ def evaluate_acceptance(
     returned by :meth:`FactorRegistry.handle_completed` /
     :func:`record_completed`. With no Registry outcome, research corr is
     ``None`` and acceptance can only succeed when ``allow_unknown`` is set —
-    UNKNOWN is never silently accepted.
+    UNKNOWN is never silently accepted. When the local correlation gate is
+    disabled in config (``correlation.enabled=false``) the research verdict is
+    NOT_APPLICABLE: it adds no rejection and acceptance falls back to BRAIN's
+    official submission checks. NOT_APPLICABLE is NOT the same as UNKNOWN —
+    nothing is pending and no evidence is required.
     """
     cfg = corr_config or CorrelationConfig()
     completed = result.status == SimulationStatus.COMPLETED
     submittable = bool(getattr(result, "is_submittable", False))
     corr_status, decision = _research_verdict(outcome)
     self_corr = getattr(result, "self_correlation", None)
+    # Disabled-by-config gate ⇒ NOT_APPLICABLE even for rows recorded before
+    # the explicit status existed (historical outcomes carry no marker).
+    if not cfg.enabled and corr_status not in (
+        CorrelationStatus.FAIL.value,
+        CorrelationStatus.NOT_APPLICABLE.value,
+    ):
+        corr_status = CorrelationStatus.NOT_APPLICABLE.value
+        decision = None
 
     reasons: list[str] = []
     if not completed:
@@ -187,7 +207,8 @@ def evaluate_acceptance(
         reasons.append(f"grade {result.grade or 'NONE'} below target")
     if not submittable:
         reasons.append("BRAIN submission checks not all PASS")
-    corr_ok = corr_status == CorrelationStatus.PASS.value
+    corr_pass = corr_status == CorrelationStatus.PASS.value
+    corr_skipped = corr_status == CorrelationStatus.NOT_APPLICABLE.value
     if corr_status == CorrelationStatus.FAIL.value:
         margin = decision.corr_margin if decision else None
         reasons.append(
@@ -200,8 +221,10 @@ def evaluate_acceptance(
         reasons.append("research correlation not evaluated")
 
     accepted = completed and grade_ok and submittable and (
-        corr_ok or (corr_status in (CorrelationStatus.UNKNOWN.value, None)
-                    and allow_unknown)
+        corr_pass or corr_skipped or (
+            corr_status in (CorrelationStatus.UNKNOWN.value, None)
+            and allow_unknown
+        )
     )
 
     return AcceptanceDecision(
@@ -242,7 +265,11 @@ def describe_corr_verdicts(
     brain_part = f"BRAIN(official>={cfg.official_threshold:.2f}): {brain} self-corr={corr_text}"
 
     corr_status, decision = _research_verdict(outcome)
-    if corr_status is None:
+    if not cfg.enabled and corr_status != CorrelationStatus.FAIL.value:
+        research_part = (
+            f"RESEARCH(<{cfg.research_threshold:.2f}): NOT_APPLICABLE (gate disabled)"
+        )
+    elif corr_status is None:
         research_part = f"RESEARCH(<{cfg.research_threshold:.2f}): NOT_EVALUATED"
     elif decision is not None:
         margin = (

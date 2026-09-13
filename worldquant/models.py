@@ -23,16 +23,36 @@ from .api import (
 
 @dataclass
 class AlphaSpec:
-    """One alpha to run: a name, an expression, optional per-alpha settings."""
+    """One alpha to run: a name, an expression, optional per-alpha settings.
+
+    The four optional metadata fields carry ablation provenance. They are
+    read by the Factor Registry pre-simulation gate (via attribute access) and
+    ignored everywhere else, so ordinary specs behave exactly as before:
+
+    * ``source`` — ``"ablation"`` marks an explicit parameter sweep variant;
+      such specs are exempt from the same-signal capacity/novelty blocks but
+      exact experiment duplicates are still rejected (unless forced).
+    * ``ablation_group_id`` — sweep id shared by every variant in one study.
+    * ``changed_parameters`` — ``{setting: new_value}`` diff vs the parent.
+    * ``parent_experiment_id`` — registry factor id of the baseline experiment.
+    """
 
     expression: str
     name: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
+    source: str | None = None
+    ablation_group_id: str | None = None
+    changed_parameters: dict[str, Any] | None = None
+    parent_experiment_id: int | None = None
 
     @property
     def label(self) -> str:
         """Display identifier: explicit name when given, otherwise the hash prefix."""
         return self.name or self.expression[:40]
+
+    @property
+    def is_ablation(self) -> bool:
+        return self.source == "ablation"
 
 
 @dataclass
