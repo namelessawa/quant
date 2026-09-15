@@ -1,0 +1,13 @@
+name,expression,delay,decay,truncation,neutralization,pasteurization,nanHandling
+p38_f6_assets,"group_zscore(winsorize(ts_mean(ts_backfill(assets, 60) / cap, 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON
+p38_f6_cflow,"group_zscore(winsorize(ts_mean(ts_backfill(cashflow_op, 60) / cap, 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON
+p38_f6_debt,"group_zscore(winsorize(-ts_mean(ts_backfill(debt, 60) / cap, 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON
+p38_f6_bvps,"group_zscore(winsorize(ts_mean(ts_backfill(bookvalue_ps, 60), 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON
+p38_f6_capex,"group_zscore(winsorize(ts_mean(ts_backfill(capex, 60) / cap, 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON
+p38_f6_cogs,"group_zscore(winsorize(-ts_mean(ts_backfill(cogs, 60) / cap, 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON
+p38_a4_eps,"group_zscore(winsorize(ts_mean(ts_backfill(actual_eps_value_quarterly, 40) / cap, 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON
+p38_a4_adjni,"group_zscore(winsorize(ts_mean(ts_backfill(adj_net_income_avg, 40) / cap, 20), std=3.0), subindustry)",1,12,0.01,NONE,ON,ON
+p38_o9_be180,"group_zscore(winsorize(ts_mean(call_breakeven_180 / close, 20), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+p38_o9_fp120,"group_zscore(winsorize(ts_mean(forward_price_120 / close, 20), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+p38_o8_ivc180,"group_zscore(winsorize(-ts_mean(implied_volatility_call_180, 20), std=3.0), industry)",1,12,0.01,NONE,ON,ON
+p38_o8_hv120,"group_zscore(winsorize(-ts_mean(historical_volatility_120, 20), std=3.0), industry)",1,12,0.01,NONE,ON,ON

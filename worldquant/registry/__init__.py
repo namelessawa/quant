@@ -77,7 +77,11 @@ from .gates import (
     duplicate_check,
     pre_simulation_gate,
 )
-from .importer import import_submitted_factors, migrate_existing_results
+from .importer import (
+    fetch_field_metadata,
+    import_submitted_factors,
+    migrate_existing_results,
+)
 from .migrations import SCHEMA_VERSION
 from .pipeline import (
     AcceptanceDecision,
@@ -158,6 +162,7 @@ __all__ = [
     # importers
     "migrate_existing_results",
     "import_submitted_factors",
+    "fetch_field_metadata",
     # pipeline adapter
     "open_registry",
     "gate_candidate",

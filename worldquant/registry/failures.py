@@ -103,7 +103,7 @@ def _check_codes(checks: dict[str, Any] | None) -> list[str]:
             continue
         result = str(payload.get("result") or "").upper()
         if result and result != "PASS":
-            code = _check_map.get(str(name).upper())
+            code = _CHECK_map.get(str(name).upper())
             if code and code not in codes:
                 codes.append(code)
     return codes

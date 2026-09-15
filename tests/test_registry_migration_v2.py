@@ -22,6 +22,7 @@ from worldquant.hashing import (
     signal_identity,
 )
 from worldquant.registry import FactorRegistry, FactorStatus
+from worldquant.registry import migrations
 from worldquant.registry.config import RegistryConfig
 from worldquant.registry.store import CORR_TYPE_SELF
 
@@ -314,13 +315,13 @@ def test_migration_is_idempotent_and_never_overwrites_backup(v1_db):
         meta = registry._query(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         )
-        assert meta and meta[0]["value"] == "3"
+        assert meta and meta[0]["value"] == str(migrations.SCHEMA_VERSION)
 
     assert backup.exists()
     assert backup.stat().st_size == first_size
     raw = sqlite3.connect(str(v1_db))
     try:
-        assert raw.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == migrations.SCHEMA_VERSION
         assert raw.execute("SELECT COUNT(*) FROM factors").fetchone()[0] == 3
     finally:
         raw.close()

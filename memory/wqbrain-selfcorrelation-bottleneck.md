@@ -410,6 +410,83 @@ fundamentally different construction is required. Datasets probed on 09-12
 (socialmedia8, fundamental2 accruals/D&A, news12) yielded nothing above 0.92
 standalone and that one is unbalanced/static.
 
+**Round 38–39 (2026-09-14): BREAKTHROUGH — mining UNUSED FIELDS inside already-used
+datasets found two new fitness-engine legs (debt/cap sh~1.11, cogs/cap sh~1.07)
+that broke the EXCELLENT+ barrier. 6 EXCELLENT + 2 GOOD 8/8 PASS in one round.**
+
+Method: used the BRAIN API (`GET {base}/data-fields?dataset.id=...&orderBy=
+alphaCount&dir=DESC`) to list top fields by usage inside fundamental6 (886 fields,
+only 1 used), analyst4 (1324 fields, only 2 used), option9 (74 fields, only 1 used),
+option8 (64 fields, only 4 used). Round 38 probed 12 standalone legs (positive
+sign), all INFERIOR standalone but two came back strongly NEGATIVE because the sign
+was flipped — the un-negated versions have sh > 1.0:
+
+| leg | dataset | standalone sh (sign-corrected) | note |
+| --- | --- | --- | --- |
+| **debt/cap** (POSITIVE) | fnd6 | **~1.11** | negated probe returned -1.11; high leverage = higher return |
+| **cogs/cap** (POSITIVE) | fnd6 | **~1.07** | negated probe returned -1.07; high cost-to-market = "value" |
+| capex/cap (POSITIVE) | fnd6 | 0.99 | near threshold; high capex intensity |
+| assets/cap (POSITIVE) | fnd6 | 0.86 | classic asset-based value |
+| adj_net_income_avg/cap (POSITIVE) | anl4 | 0.86 | analyst adjusted NI |
+| cashflow_op/cap (POSITIVE) | fnd6 | 0.80 | operating cashflow yield; best book balance |
+| actual_eps_value_quarterly/cap (POSITIVE) | anl4 | 0.50 | weak |
+| bookvalue_ps (POSITIVE) | fnd6 | 0.19 | dead |
+| call_breakeven_180/close (POSITIVE) | opt9 | 0.07 | dead |
+| forward_price_120/close (POSITIVE) | opt9 | 0.30 | weak |
+| -implied_volatility_call_180 | opt8 | -0.01 | dead (negation wrong → +sign also weak) |
+| -historical_volatility_120 | opt8 | 0.02 | dead |
+
+All fundamental6 yield factors (X/cap) are POSITIVE sign. The two highest-alphaCount
+unused fields in fundamental6 (assets 178k, cashflow_op 26k, debt 33k, capex 32k,
+cogs 11k) are all worth probing — the field usage count is a valid signal-strength
+prior. Round 38 also confirmed: fnd6 fields have ~1.3% turnover (very slow,
+quarterly reporting) and unbalanced books standalone, but blending with the
+continuous analyst core fixes the balance.
+
+**Round 39 — the winning blends (all decay=7, trunc=0.01, k250, delay=1,
+USA/TOP3000/NONE/ON/ON, P1Y):**
+
+| alpha | recipe | grade | fit | sh | test | sc |
+| --- | --- | --- | --- | --- | --- | --- |
+| **`2rOxeAvJ`** (`r39_r3g2u`) | r3+g2+u (cogs×2+rel_num_all) | **EXCELLENT** | **2.26** | 2.16 | 1.37 | **0.6753** |
+| **`WjPRJ53N`** (`r39_r4d2gu`) | r4+d2+g+u (debt×2+cogs+rel_num_all) | **EXCELLENT** | **2.25** | 2.09 | 0.89 | **0.6446** |
+| **`LL9w3KJm`** (`r39_r3d2u`) | r3+d2+u (debt×2+rel_num_all) | **EXCELLENT** | **2.23** | 2.11 | 0.81 | **0.6536** |
+| **`XgWxMZg1`** (`r39_r3d2gu`) | r3+d2+g+u (debt×2+cogs+rel_num_all) | **EXCELLENT** | **2.14** | 1.96 | 0.90 | **0.5887** |
+| **`qMWpVVQj`** (`r39_r4d2g`) | r4+d2+g (debt×2+cogs) | **EXCELLENT** | **2.10** | 1.98 | 0.73 | **0.6155** |
+| **`9qV32zMq`** (`r39_r3d2xu`) | r3+d2+x+u (debt×2+capex+rel_num_all) | **EXCELLENT** | **2.09** | 1.94 | 0.91 | **0.5791** |
+| `gJQ5LavK` (`r39_r3d2g`) | r3+d2+g (debt×2+cogs) | GOOD | 2.00 | 1.85 | 0.72 | 0.5581 |
+| `883ZXw9m` (`r39_r3d2g_k500`) | r3+d2+g k500 (debt×2+cogs, slow window) | GOOD | 1.87 | 1.77 | 0.91 | 0.5274 |
+
+FAIL (EXCELLENT but sc > 0.7): `vRkbPGlr` (r4+d2+u, fit 2.32/sc 0.7076 — over
+by 0.008), `d5O6vo1K` (r4+g2+u, fit 2.35/sc 0.7254).
+
+**Key findings:**
+- **cogs/cap is the strongest new decorrelator** — in the r3+g2+u blend, it
+  pushes fitness to 2.26 (vs old r3+u+o 1.90) while keeping sc at 0.675 (vs
+  old 0.687). The PnL pattern of cost-of-goods-sold relative to market cap
+  is genuinely different from both the analyst estimate core AND the submitted
+  alphas.
+- **debt/cap is the strongest sc diluter** — blends with d2 (debt×2) consistently
+  show sc 0.52–0.65, ~0.05–0.10 lower than equivalent cogs blends. Adding both
+  d+g drops sc further (r3d2gu 0.589, r3d2g 0.558, r3d2g_k500 0.527).
+- **The new fitness–sc frontier** (replacing the 09-12 map):
+  - r3+g2+u k250 d7: fit 2.26/sc 0.675 ← **EXCELLENT+ sweet spot**
+  - r4+d2+u k250 d7: fit 2.32/sc 0.708 ← over by 0.008
+  - r4+g2+u k250 d7: fit 2.35/sc 0.725 ← over by 0.025
+  - r3+d2+g k500 d7: fit 1.87/sc 0.527 ← safest (lowest sc)
+- **debt/cap + cogs/cap together are the ultimate decorrelator pair** —
+  they're from the same dataset (fnd6) but economically orthogonal (leverage
+  vs cost efficiency), and their PnLs compound to give sc as low as 0.527.
+- All 8 winners share r (analyst core) and most share d or g — submitting
+  one will poison the family as before. The most distinct is `9qV32zMq`
+  (uses capex instead of cogs) or `883ZXw9m` (k500 window).
+
+**Today's submittable pool (14 total, 8 new + 6 from prior rounds):**
+6 EXCELLENT (fit 2.09–2.26, sc 0.579–0.675) + 2 GOOD (fit 1.87–2.00, sc
+0.527–0.558) from round 39; plus 4 GOOD from round 36–37 (fit 1.52–1.90,
+sc 0.658–0.687) and `Vk627oWY` (GOOD 0.6987). Best pick for submission:
+`2rOxeAvJ` (fit 2.26, test 1.37, sc 0.675) — highest fitness with strong OOS.
+
 Three structural changes were required — round 14 tried the same option fields
 with the analyst recipe and got **10/10 INFERIOR**:
 

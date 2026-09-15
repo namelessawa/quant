@@ -25,6 +25,12 @@ from ..logging_utils import get_logger
 from .correlation import CorrelationStatus
 from .store import CORR_TYPE_SELF, CORR_TYPE_SELF_MAX, FactorRegistry, FactorStatus
 
+#: Minimum number of recorded /check attempts before a PENDING
+#: SELF_CORRELATION combined with another FAIL gate is accepted as terminal.
+#: Protects a freshly simulated alpha whose metric checks have not themselves
+#: resolved on the very first poll.
+_GATE_MIN_ATTEMPTS = 2
+
 
 def _refresh_one(
     client: Any,
@@ -50,7 +56,20 @@ def _refresh_one(
 
     neighbors = checked.get("self_correlated_with") if isinstance(checked, dict) else None
     max_self = checked.get("self_correlation") if isinstance(checked, dict) else None
+    checks = checked.get("checks") if isinstance(checked, dict) else None
+    total_checks = checked.get("total") if isinstance(checked, dict) else None
     neighbors_written = 0
+
+    # check_submission degrades a throttled / not-yet-computed answer to the
+    # empty shape instead of raising. That is *not* evidence and must remain a
+    # retry target; record it as an error so callers can tell throttling apart
+    # from a parsed PENDING (the normal state right after first triggering).
+    if not total_checks and not neighbors and max_self is None:
+        registry.mark_corr_checked(
+            factor_id, error="check unavailable (throttled or still computing)"
+        )
+        return "ERROR", 0
+
     if isinstance(neighbors, list) and neighbors:
         neighbors_written = registry.save_correlations(
             factor_id, neighbors, CORR_TYPE_SELF
@@ -61,11 +80,69 @@ def _refresh_one(
             factor_id, [{"correlation": float(max_self)}], CORR_TYPE_SELF_MAX
         )
 
+    # Decide whether the /check delivered *final* self-correlation evidence.
+    # A concrete neighbour recordset is always final (edges just written); a
+    # resolved SELF_CORRELATION check is final too — including a zero-neighbour
+    # PASS, which is authoritative "no pairwise edges".
+    self_result = ""
+    checks_by_name = checks if isinstance(checks, dict) else {}
+    self_check = checks_by_name.get("SELF_CORRELATION")
+    if isinstance(self_check, dict):
+        self_result = str(self_check.get("result") or "").upper()
+
+    # The platform only schedules the SELF_CORRELATION computation once every
+    # other submission gate passes; an alpha failing e.g. LOW_FITNESS keeps
+    # SELF_CORRELATION at PENDING for its entire lifetime (empirically
+    # re-polling for >12h never changes it). Likewise an ALREADY_SUBMITTED
+    # duplicate's /check only echoes that one verdict and never exposes a
+    # corr recordset. Both are terminal *evidence-not-available* states: the
+    # corr verdict stays UNKNOWN (never fabricated), but the factor must leave
+    # the backfill set instead of being re-fetched forever. The small attempt
+    # guard avoids finalizing a brand-new alpha whose other checks have not
+    # themselves resolved yet.
+    note: str | None = None
+    if isinstance(neighbors, list) and neighbors:
+        note = "SELF_NEIGHBORS"
+    elif self_result == "PASS":
+        note = "SELF_PASS"
+    elif self_result == "FAIL":
+        note = "SELF_FAIL"
+    elif self_result == "ERROR":
+        note = "SELF_ERROR"
+    else:
+        already_submitted = (
+            isinstance(checks_by_name.get("ALREADY_SUBMITTED"), dict)
+            and str(
+                checks_by_name["ALREADY_SUBMITTED"].get("result") or ""
+            ).upper()
+            == "FAIL"
+        )
+        other_failures = sorted(
+            name
+            for name, check in checks_by_name.items()
+            if name not in {"SELF_CORRELATION", "ALREADY_SUBMITTED"}
+            and isinstance(check, dict)
+            and str(check.get("result") or "").upper() == "FAIL"
+        )
+        attempts = int(factor.get("corr_check_attempts") or 0)
+        if already_submitted:
+            note = "ALREADY_SUBMITTED"
+        elif other_failures and attempts >= _GATE_MIN_ATTEMPTS:
+            note = "GATED:" + ",".join(other_failures)
+
     verdict = CorrelationStatus.UNKNOWN.value
-    if factor.get("status") == FactorStatus.SIMULATED:
+    if factor.get("status") == FactorStatus.SIMULATED and note in {
+        "SELF_NEIGHBORS", "SELF_PASS", "SELF_FAIL", "SELF_ERROR",
+    }:
         decision = registry.apply_correlation_gate(factor_id)
         verdict = decision.status.value
-    registry.mark_corr_checked(factor_id)
+
+    if note is not None:
+        registry.mark_corr_evidence_final(factor_id, note=note)
+    else:
+        # PENDING / missing with no gating failure: the async check has not
+        # computed yet and the factor stays a target.
+        registry.mark_corr_checked(factor_id)
     return verdict, neighbors_written
 
 

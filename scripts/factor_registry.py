@@ -46,6 +46,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from worldquant import (  # noqa: E402
     WorldQuantClient,
+    fetch_field_metadata,
     get_logger,
     import_submitted_factors,
     load_config,
@@ -145,6 +146,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill.add_argument("--limit", type=int, default=100,
                           help="maximum factors to backfill this run")
+
+    fetch_fields = sub.add_parser(
+        "fetch-fields",
+        help="fetch metadata for fields used by stored factors via "
+             "GET /data-fields/{id} (read-only; never the full field library)",
+    )
+    fetch_fields.add_argument("--limit", type=int, default=None,
+                              help="cap the number of fields fetched this run")
+    fetch_fields.add_argument("--all", action="store_true", dest="refetch_all",
+                              help="re-fetch even fields already cached")
 
     clusters = sub.add_parser(
         "clusters",
@@ -254,6 +265,19 @@ def cmd_backfill_corr(registry, config, args, log) -> int:
         config,
         lambda client: backfill_correlations(
             client, registry, limit=args.limit, log=log
+        ),
+    )
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return EXIT_OK
+
+
+def cmd_fetch_fields(registry, config, args, log) -> int:
+    summary = _with_client(
+        config,
+        lambda client: fetch_field_metadata(
+            client, registry,
+            only_missing=not args.refetch_all,
+            limit=args.limit, log=log,
         ),
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -542,6 +566,75 @@ def _recent(registry, status: str, *, limit: int = 10) -> list[dict[str, Any]]:
     return registry.get_factors_by_status(status, limit=limit)
 
 
+def _correlation_evidence(registry) -> dict:
+    """Summarize SELF-correlation evidence availability for the report."""
+    brain_linked = int(registry._query(
+        "SELECT COUNT(*) AS n FROM factors WHERE brain_alpha_id IS NOT NULL"
+    )[0]["n"])
+    no_brain = int(registry._query(
+        "SELECT COUNT(*) AS n FROM factors WHERE brain_alpha_id IS NULL"
+    )[0]["n"])
+    self_edges = int(registry._query(
+        "SELECT COUNT(*) AS n FROM factor_correlations WHERE correlation_type='SELF'"
+    )[0]["n"])
+    self_edge_factors = int(registry._query(
+        "SELECT COUNT(DISTINCT factor_id) AS n FROM factor_correlations "
+        "WHERE correlation_type='SELF'"
+    )[0]["n"])
+
+    note_rows = registry._query(
+        """
+        SELECT CASE
+                   WHEN corr_evidence_note LIKE 'GATED:%' THEN 'GATED'
+                   ELSE COALESCE(corr_evidence_note, 'LEGACY_FINAL')
+               END AS state,
+               COUNT(*) AS n
+          FROM factors
+         WHERE corr_evidence_final_at IS NOT NULL
+         GROUP BY state ORDER BY n DESC
+        """
+    )
+    state_counts: dict[str, int] = {
+        str(row["state"]): int(row["n"]) for row in note_rows
+    }
+    pending = int(registry._query(
+        """
+        SELECT COUNT(*) AS n FROM factors f
+         WHERE f.brain_alpha_id IS NOT NULL
+           AND f.corr_evidence_final_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM factor_correlations c
+                WHERE c.factor_id = f.id AND c.correlation_type = 'SELF')
+        """
+    )[0]["n"])
+
+    ordered_states = [
+        "SELF_NEIGHBORS", "SELF_PASS", "SELF_FAIL", "SELF_ERROR",
+        "GATED", "ALREADY_SUBMITTED", "LEGACY_FINAL",
+    ]
+    states = [(s, state_counts.pop(s)) for s in ordered_states
+              if state_counts.get(s)]
+    states.extend((s, n) for s, n in sorted(state_counts.items()))
+    states.append(("PENDING", pending))
+    states.append(("NO_BRAIN_ID", no_brain))
+
+    gated = registry._query(
+        """
+        SELECT substr(corr_evidence_note, 7) AS gates, COUNT(*) AS n
+          FROM factors
+         WHERE corr_evidence_note LIKE 'GATED:%'
+         GROUP BY gates ORDER BY n DESC LIMIT 8
+        """
+    )
+    return {
+        "brain_linked": brain_linked,
+        "self_edges": self_edges,
+        "self_edge_factors": self_edge_factors,
+        "states": states,
+        "gated_detail": [(str(r["gates"]), int(r["n"])) for r in gated],
+    }
+
+
 def build_markdown_report(registry) -> str:
     stats = registry.stats()
     lines: list[str] = []
@@ -631,6 +724,41 @@ def build_markdown_report(registry) -> str:
                 f"{_fmt(cluster['sharpe'])} | {_fmt(cluster['fitness'])} | `{expr}` |"
             )
         lines.append("")
+
+    lines.append("### Correlation evidence coverage")
+    lines.append("")
+    cov = _correlation_evidence(registry)
+    lines.append(
+        f"Brain-linked factors: {cov['brain_linked']}; pairwise SELF edges: "
+        f"{cov['self_edges']} across {cov['self_edge_factors']} factor(s)."
+    )
+    lines.append("")
+    lines.append("| Evidence state | Count | Meaning |")
+    lines.append("| --- | ---: | --- |")
+    meaning = {
+        "SELF_NEIGHBORS": "concrete neighbour recordset (real graph edges)",
+        "SELF_PASS": "SELF_CORRELATION resolved PASS, zero neighbours",
+        "SELF_FAIL": "SELF_CORRELATION resolved FAIL",
+        "SELF_ERROR": "platform returned an error verdict",
+        "GATED": "fails another submission gate; platform never schedules corr",
+        "ALREADY_SUBMITTED": "duplicate alpha; /check exposes no corr",
+        "LEGACY_FINAL": "finalized before note classification",
+        "PENDING": "corr genuinely still computing / awaiting re-poll",
+        "NO_BRAIN_ID": "local factor without a brain alpha id",
+    }
+    for state, count in cov["states"]:
+        lines.append(f"| {state} | {count} | {meaning.get(state, '')} |")
+    lines.append("")
+    gated_detail = cov["gated_detail"]
+    if gated_detail:
+        detail = ", ".join(f"{gate}×{n}" for gate, n in gated_detail)
+        lines.append(f"Gating gates observed: {detail}")
+        lines.append("")
+    lines.append(
+        "_GATED / ALREADY_SUBMITTED factors keep corr verdict UNKNOWN: the "
+        "evidence is not available on the platform, not a PASS/FAIL._"
+    )
+    lines.append("")
 
     lines.append("## 8. Saturated and Successful Combinations")
     lines.append("")
@@ -858,6 +986,8 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_refresh_corr(registry, config, args, log)
             if args.command == "backfill-corr":
                 return cmd_backfill_corr(registry, config, args, log)
+            if args.command == "fetch-fields":
+                return cmd_fetch_fields(registry, config, args, log)
             if args.command == "clusters":
                 return cmd_clusters(registry, config, args, log)
             log.error("unknown command: %s", args.command)

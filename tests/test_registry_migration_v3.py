@@ -105,7 +105,7 @@ def test_v2_to_v3_is_idempotent_and_never_overwrites_backup(tmp_path):
         meta = registry._query(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         )
-        assert meta and meta[0]["value"] == "3"
+        assert meta and meta[0]["value"] == str(migrations.SCHEMA_VERSION)
         before = {
             row["id"]: (row["expression_hash"], row["signal_hash"])
             for row in registry._query(
@@ -126,6 +126,6 @@ def test_v2_to_v3_is_idempotent_and_never_overwrites_backup(tmp_path):
     assert backup.stat().st_size == first_size
     raw = sqlite3.connect(str(db_path))
     try:
-        assert raw.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == migrations.SCHEMA_VERSION
     finally:
         raw.close()

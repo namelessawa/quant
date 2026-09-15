@@ -22,6 +22,8 @@ __pycache__/
 # local artifacts
 data/*.db
 data/*.db.bak
+data/*.db-wal
+data/*.db-shm
 data/*.bak
 data/*.sqlite3
 data/results.csv
@@ -29,3 +31,9 @@ data/passed.csv
 data/failed.csv
 logs/*.log
 logs/*.out
+
+# temp scratch files (scripts, probes, logs)
+/_*.py
+/_*.log
+/ERROR
+/WARNING

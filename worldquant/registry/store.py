@@ -142,7 +142,12 @@ CREATE TABLE IF NOT EXISTS factors (
     expression_hash      TEXT,
     corr_last_checked_at TEXT,
     corr_check_attempts  INTEGER NOT NULL DEFAULT 0,
-    corr_error           TEXT
+    corr_error           TEXT,
+    -- v4: final SELF_CORRELATION evidence obtained via GET /alphas/{id}/check
+    corr_evidence_final_at TEXT,
+    -- v5: why evidence is final (SELF_PASS/SELF_FAIL/SELF_NEIGHBORS/
+    -- GATED:<checks>/ALREADY_SUBMITTED); NULL while still pending
+    corr_evidence_note    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS factor_metrics (
@@ -244,6 +249,28 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key        TEXT PRIMARY KEY,
     value      TEXT
 );
+
+-- Field metadata cache, populated on demand from GET /data-fields/{id}.
+-- Only fields actually used by stored factors are fetched; this table is
+-- read-side enrichment (semantics / dataset / family) and never participates
+-- in expression/signal/experiment identity hashing.
+CREATE TABLE IF NOT EXISTS field_metadata (
+    field_id        TEXT PRIMARY KEY,
+    dataset_id      TEXT,
+    dataset_name    TEXT,
+    category_id     TEXT,
+    category_name   TEXT,
+    subcategory_id  TEXT,
+    subcategory_name TEXT,
+    description     TEXT,
+    field_type      TEXT,
+    visualizable    INTEGER,
+    raw_json        TEXT,
+    fetched_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_field_metadata_dataset ON field_metadata(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_field_metadata_category ON field_metadata(category_id);
 
 CREATE INDEX IF NOT EXISTS idx_factors_template    ON factors(template_hash);
 CREATE INDEX IF NOT EXISTS idx_factors_structure   ON factors(structure_hash);
@@ -492,16 +519,12 @@ class FactorRegistry:
         fp = self.fingerprints(expression, settings)
         exact_hash = fp["exact_hash"]
 
-        existing = self._query(
-            "SELECT id, status FROM factors WHERE exact_hash = ?", (exact_hash,)
-        )
-        if existing:
-            return RegisteredCandidate(
-                factor_id=int(existing[0]["id"]),
-                created=False,
-                exact_hash=exact_hash,
-                status=str(existing[0]["status"]),
-            )
+        # A BRAIN alpha id is the authoritative identity for a simulated or
+        # submitted alpha: when one is supplied, prefer the row that already
+        # carries it over an exact-hash match. Otherwise importing a live
+        # alpha whose expression has drifted (or a re-run that landed on a
+        # different exact row) tries to set a brain_alpha_id already owned by
+        # another factor and violates the UNIQUE constraint.
         if brain_alpha_id:
             linked = self._query(
                 "SELECT id, status FROM factors WHERE brain_alpha_id = ?",
@@ -512,6 +535,17 @@ class FactorRegistry:
                     factor_id=int(linked[0]["id"]), created=False,
                     exact_hash=exact_hash, status=str(linked[0]["status"]),
                 )
+
+        existing = self._query(
+            "SELECT id, status FROM factors WHERE exact_hash = ?", (exact_hash,)
+        )
+        if existing:
+            return RegisteredCandidate(
+                factor_id=int(existing[0]["id"]),
+                created=False,
+                exact_hash=exact_hash,
+                status=str(existing[0]["status"]),
+            )
 
         scope = fp["scope_settings"]
         now = utcnow_iso()
@@ -1135,17 +1169,30 @@ class FactorRegistry:
         return [dict(row) for row in self._query("\n".join(sql), tuple(params))]
 
     def list_corr_backfill_targets(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        """Factors with a brain id but no per-neighbor (SELF) correlation rows."""
+        """Factors with a brain id but no final per-neighbour (SELF) evidence.
+
+        A factor leaves the backfill set in either of two ways:
+
+        * it has concrete SELF edges (``factor_correlations`` rows), or
+        * a read-only ``GET /alphas/{id}/check`` returned *final*
+          SELF_CORRELATION evidence (``corr_evidence_final_at`` set) — a
+          zero-neighbour PASS is complete evidence that the graph is correctly
+          edgeless, so it must not be re-fetched forever.
+
+        Factors whose check errored, was rate-limited or still reported
+        SELF_CORRELATION as PENDING remain targets for the next idempotent run.
+        """
         rows = self._query(
             """
             SELECT * FROM factors
              WHERE brain_alpha_id IS NOT NULL
+               AND corr_evidence_final_at IS NULL
                AND NOT EXISTS (
                    SELECT 1 FROM factor_correlations c
                     WHERE c.factor_id = factors.id
                       AND c.correlation_type = ?
                )
-             ORDER BY id DESC
+             ORDER BY corr_check_attempts ASC, id DESC
              LIMIT ?
             """,
             (CORR_TYPE_SELF, int(limit)),
@@ -1173,6 +1220,47 @@ class FactorRegistry:
                  WHERE id = ?
                 """,
                 (utcnow_iso(), factor_id),
+            )
+
+    def mark_corr_evidence_final(
+        self, factor_id: int, note: str | None = None
+    ) -> None:
+        """Record that a /check returned final SELF_CORRELATION evidence.
+
+        Covers both FAIL-with-neighbours (SELF rows saved separately) and the
+        zero-neighbour PASS: the latter is authoritative "no edges" and must
+        leave the backfill target set even though no correlation row exists.
+
+        ``note`` records *why* evidence is final (see
+        :data:`worldquant.registry.migrations.FACTOR_COLUMNS_V5`). It is also
+        used for terminal platform-unavailable states (``GATED:*`` /
+        ``ALREADY_SUBMITTED``) where the corr verdict stays UNKNOWN. An
+        existing note is never overwritten with NULL, so reobserving real
+        evidence later upgrades rather than erases the reason.
+        """
+        now = utcnow_iso()
+        if note:
+            self._execute(
+                """
+                UPDATE factors SET corr_check_attempts = corr_check_attempts + 1,
+                                   corr_last_checked_at = ?,
+                                   corr_evidence_final_at = ?,
+                                   corr_evidence_note = ?,
+                                   corr_error = NULL
+                 WHERE id = ?
+                """,
+                (now, now, str(note)[:200], factor_id),
+            )
+        else:
+            self._execute(
+                """
+                UPDATE factors SET corr_check_attempts = corr_check_attempts + 1,
+                                   corr_last_checked_at = ?,
+                                   corr_evidence_final_at = ?,
+                                   corr_error = NULL
+                 WHERE id = ?
+                """,
+                (now, now, factor_id),
             )
 
     def apply_correlation_gate(self, factor_id: int) -> CorrelationDecision:
@@ -1515,6 +1603,86 @@ class FactorRegistry:
                     "assigned_locals_json", "combination_keys_json", "feature_json"):
             data[key.replace("_json", "")] = _loads(data.pop(key), [])
         return data
+
+    # ------------------------------------------------------------------ #
+    # Field metadata cache (read-side enrichment only)
+    # ------------------------------------------------------------------ #
+    def distinct_used_fields(self) -> list[str]:
+        """Every data field referenced by at least one stored factor.
+
+        Reads ``factor_features.fields_json`` (a JSON list), so it reflects
+        the fields actually used by historical alphas — no full BRAIN field
+        library is ever fetched.
+        """
+        rows = self._query("SELECT fields_json FROM factor_features")
+        seen: set[str] = set()
+        for row in rows:
+            fields = _loads(row["fields_json"], [])
+            if isinstance(fields, list):
+                for f in fields:
+                    if isinstance(f, str) and f:
+                        seen.add(f)
+        return sorted(seen)
+
+    def upsert_field_metadata(
+        self, field_id: str, payload: dict[str, Any]
+    ) -> None:
+        """Persist one ``GET /data-fields/{id}`` response.
+
+        Extracts the fields that exist in the real response shape
+        (``dataset``, ``category``, ``subcategory``, ``description``, ``type``,
+        ``visualizable``) defensively — missing keys stay NULL — and always
+        stores the full ``raw_json`` for later introspection.
+        """
+        dataset = payload.get("dataset") if isinstance(payload.get("dataset"), dict) else {}
+        category = payload.get("category") if isinstance(payload.get("category"), dict) else {}
+        subcategory = (
+            payload.get("subcategory")
+            if isinstance(payload.get("subcategory"), dict) else {}
+        )
+        self._execute(
+            """
+            INSERT INTO field_metadata (
+                field_id, dataset_id, dataset_name, category_id, category_name,
+                subcategory_id, subcategory_name, description, field_type,
+                visualizable, raw_json, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(field_id) DO UPDATE SET
+                dataset_id=excluded.dataset_id,
+                dataset_name=excluded.dataset_name,
+                category_id=excluded.category_id,
+                category_name=excluded.category_name,
+                subcategory_id=excluded.subcategory_id,
+                subcategory_name=excluded.subcategory_name,
+                description=excluded.description,
+                field_type=excluded.field_type,
+                visualizable=excluded.visualizable,
+                raw_json=excluded.raw_json,
+                fetched_at=excluded.fetched_at
+            """,
+            (
+                str(field_id),
+                dataset.get("id"), dataset.get("name"),
+                category.get("id"), category.get("name"),
+                subcategory.get("id"), subcategory.get("name"),
+                payload.get("description"),
+                payload.get("type"),
+                1 if payload.get("visualizable") else 0,
+                json.dumps(payload, ensure_ascii=False),
+                utcnow_iso(),
+            ),
+        )
+
+    def get_field_metadata(self, field_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT * FROM field_metadata WHERE field_id = ?", (str(field_id),)
+        )
+        if not rows:
+            return None
+        return dict(rows[0])
+
+    def list_field_metadata(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._query("SELECT * FROM field_metadata ORDER BY field_id")]
 
     def _row_similarity_inputs(
         self, row: sqlite3.Row | dict[str, Any]

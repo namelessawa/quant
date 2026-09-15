@@ -22,6 +22,17 @@ Migration history:
   recomputed to include region/universe/delay), plus correlation-refresh
   bookkeeping columns (``corr_last_checked_at`` / ``corr_check_attempts`` /
   ``corr_error``).
+* v3 -> v4: ``corr_evidence_final_at`` marks a factor whose read-only
+  ``GET /alphas/{id}/check`` returned *final* SELF_CORRELATION evidence,
+  including the zero-neighbour PASS case. Without it, an alpha that genuinely
+  has no pairwise edges stays a backfill target forever.
+* v4 -> v5: ``corr_evidence_note`` records *why* evidence is final. The
+  platform only schedules the SELF_CORRELATION computation once every other
+  submission check passes, so an alpha failing e.g. LOW_FITNESS keeps
+  SELF_CORRELATION at PENDING forever; an ALREADY_SUBMITTED duplicate never
+  exposes a recordset either. Those are terminal "evidence not available on
+  the platform" states (corr verdict stays UNKNOWN — never a fabricated
+  PASS/FAIL), distinguishable in reports from genuinely-still-pending alphas.
 """
 
 from __future__ import annotations
@@ -31,7 +42,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 #: New factors columns added by the v1 -> v2 migration.
 FACTOR_COLUMNS_V2: dict[str, str] = {
@@ -63,6 +74,26 @@ FACTOR_COLUMNS_V3: dict[str, str] = {
     "corr_last_checked_at": "TEXT",
     "corr_check_attempts": "INTEGER NOT NULL DEFAULT 0",
     "corr_error": "TEXT",
+}
+
+#: New factors columns added by the v3 -> v4 migration.
+FACTOR_COLUMNS_V4: dict[str, str] = {
+    # Set when GET /alphas/{id}/check returned final SELF_CORRELATION evidence
+    # (PASS/FAIL or a concrete neighbour recordset). A zero-neighbour PASS is
+    # complete evidence: the graph is correctly edgeless for that alpha, so it
+    # must not be retried on every backfill run.
+    "corr_evidence_final_at": "TEXT",
+}
+
+#: New factors columns added by the v4 -> v5 migration.
+FACTOR_COLUMNS_V5: dict[str, str] = {
+    # Why corr evidence was marked final. Real-evidence notes:
+    #   "SELF_PASS" / "SELF_FAIL" / "SELF_NEIGHBORS" (concrete recordset).
+    # Platform-unavailable notes (corr verdict stays UNKNOWN):
+    #   "GATED:<checks>" — SELF_CORRELATION is never scheduled while another
+    #      submission check is FAIL;
+    #   "ALREADY_SUBMITTED" — a duplicate alpha whose /check exposes no corr.
+    "corr_evidence_note": "TEXT",
 }
 
 FEATURE_COLUMNS: dict[str, str] = {
@@ -114,7 +145,12 @@ _EXTRA_DDL_V3 = """
 CREATE INDEX IF NOT EXISTS idx_factors_expression_hash   ON factors(expression_hash);
 """
 
-_EXTRA_DDL = _EXTRA_DDL_V2 + _EXTRA_DDL_V3
+#: Objects introduced by v3 -> v4.
+_EXTRA_DDL_V4 = """
+CREATE INDEX IF NOT EXISTS idx_factors_corr_final        ON factors(corr_evidence_final_at);
+"""
+
+_EXTRA_DDL = _EXTRA_DDL_V2 + _EXTRA_DDL_V3 + _EXTRA_DDL_V4
 
 
 def user_version(conn: sqlite3.Connection) -> int:
@@ -178,7 +214,7 @@ def ensure_migrated(
     """Bring the database up to :data:`SCHEMA_VERSION`.
 
     Returns ``{"from_version", "to_version", "levels"}`` where ``levels`` lists
-    the migration levels applied during THIS call (subset of ``{2, 3}``); an
+    the migration levels applied during THIS call (subset of ``{2, 3, 4}``); an
     empty list means the database was already current. Safe to call on a
     freshly-created latest-schema database.
     """
@@ -231,6 +267,46 @@ def ensure_migrated(
         conn.execute("PRAGMA user_version = 3")
         result["levels"].append(3)
         log.info("registry migrated to schema v3 (factor +%d)", len(added_v3))
+
+    if version < 4:
+        if populated:
+            if 2 not in result["levels"] and 3 not in result["levels"]:
+                _backup_database(path, log, 3)
+        added_v4 = _add_columns(conn, "factors", FACTOR_COLUMNS_V4)
+        conn.executescript(_EXTRA_DDL_V4)
+        conn.execute("PRAGMA user_version = 4")
+        result["levels"].append(4)
+        log.info("registry migrated to schema v4 (factor +%d)", len(added_v4))
+
+    if version < 5:
+        if populated:
+            if not result["levels"]:
+                _backup_database(path, log, 4)
+        added_v5 = _add_columns(conn, "factors", FACTOR_COLUMNS_V5)
+        if added_v5:
+            # Backfill evidence notes for rows finalized under v4: the note
+            # describes the evidence shape actually on file.
+            conn.execute(
+                """
+                UPDATE factors SET corr_evidence_note = 'SELF_NEIGHBORS'
+                 WHERE corr_evidence_final_at IS NOT NULL
+                   AND corr_evidence_note IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM factor_correlations c
+                        WHERE c.factor_id = factors.id
+                          AND c.correlation_type = 'SELF')
+                """
+            )
+            conn.execute(
+                """
+                UPDATE factors SET corr_evidence_note = 'SELF_PASS'
+                 WHERE corr_evidence_final_at IS NOT NULL
+                   AND corr_evidence_note IS NULL
+                """
+            )
+        conn.execute("PRAGMA user_version = 5")
+        result["levels"].append(5)
+        log.info("registry migrated to schema v5 (factor +%d)", len(added_v5))
 
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",

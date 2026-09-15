@@ -268,3 +268,58 @@ def import_submitted_factors(
 
     log.info("submitted-alpha import: %s", json.dumps(summary))
     return summary
+
+
+# --------------------------------------------------------------------------- #
+# Field metadata enrichment (read-only, on-demand)
+# --------------------------------------------------------------------------- #
+def fetch_field_metadata(
+    client: Any,
+    registry: "FactorRegistry",
+    *,
+    only_missing: bool = True,
+    limit: int | None = None,
+    log: Any = None,
+) -> dict[str, int]:
+    """Fetch metadata for fields actually used by stored factors.
+
+    Only the distinct field_ids referenced in ``factor_features.fields_json``
+    are ever requested — the full BRAIN field library is never pulled. Each
+    response is stored via :meth:`FactorRegistry.upsert_field_metadata`.
+    Idempotent: re-running skips already-fetched fields when ``only_missing``
+    is set. Read-only GET; no simulation, no submission.
+    """
+    from time import sleep
+
+    log = log or get_logger("registry.importer")
+    used = registry.distinct_used_fields()
+    existing = {
+        row["field_id"] for row in registry.list_field_metadata()
+    } if only_missing else set()
+    targets = [fid for fid in used if fid not in existing]
+    if limit is not None:
+        targets = targets[: int(limit)]
+
+    summary = {
+        "used_fields": len(used),
+        "already_cached": len(used) - len(targets) if only_missing else 0,
+        "fetched": 0,
+        "unavailable": 0,
+    }
+    log.info(
+        "fetching metadata for %d/%d used field(s) (GET /data-fields/{id})",
+        len(targets), len(used),
+    )
+    for field_id in targets:
+        payload = client.get_data_field(field_id)
+        if not payload:
+            summary["unavailable"] += 1
+            continue
+        registry.upsert_field_metadata(field_id, payload)
+        summary["fetched"] += 1
+        # Be polite to the API; min_request_interval already throttles the
+        # client, but a tiny sleep keeps burst behavior predictable.
+        sleep(0.0)
+
+    log.info("field metadata fetch: %s", json.dumps(summary))
+    return summary

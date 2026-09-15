@@ -91,8 +91,22 @@ def _top_fields(registry: FactorRegistry, limit: int) -> list[dict[str, Any]]:
     for row in rows:
         for field in _safe_json(row["fields_json"]):
             counts[str(field)] = counts.get(str(field), 0) + 1
-    ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)
-    return [{"field": name, "trials": count} for name, count in ordered[:limit]]
+    ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+    # Enrich only the top fields with dataset/category/short description from
+    # the field_metadata cache. This keeps the prompt compact — the full 80+
+    # field library is never dumped. Missing metadata degrades to the field id.
+    out: list[dict[str, Any]] = []
+    for name, count in ordered:
+        meta = registry.get_field_metadata(name)
+        item: dict[str, Any] = {"field": name, "trials": count}
+        if meta:
+            item["dataset"] = meta.get("dataset_id")
+            item["category"] = meta.get("category_name")
+            desc = meta.get("description")
+            if desc:
+                item["description"] = str(desc)[:120]
+        out.append(item)
+    return out
 
 
 def _underexplored_datasets(registry: FactorRegistry, limit: int) -> list[dict[str, Any]]:
